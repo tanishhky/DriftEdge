@@ -77,30 +77,72 @@ Compared to PinSight: there's no RND engine because the "implied distribution" o
 
 **Goal:** Given path/flow output and an estimated `p`, compute an actionable position size.
 
-**Step 1: estimate `p`.** This is the hardest step. Options:
-- **Path-based estimate:** project recent drift forward to resolution (works for stable trends)
-- **Flow-based shrinkage:** if flow strongly agrees, shrink `p` toward the side flow indicates; if mixed, anchor `p` to current price (no edge)
-- **External-data-based:** for sports/political markets, plug in domain models (polls, ELO ratings). Out of scope for v0.
+### CRITICAL: price ≠ probability
 
-For v0: a simple weighted average of (current price) and (flow-implied probability), tuned to be conservative.
+The market price `c` is NOT a clean estimate of the true probability `p`. They diverge for at least nine documented reasons:
 
-**Step 2: compute Kelly fraction.**
+| Divergence source | Typical magnitude | Treatment |
+|---|---|---|
+| Bid-ask spread | 1–5¢ liquid, much wider thin | Use mid; reject if spread > 4¢ |
+| Trading fees (round-trip) | Kalshi ~$0.07/contract; Polymarket 2% on resolution gains | Subtract from expected payoff |
+| Withdrawal / on-chain costs (Polymarket) | Variable | Amortize per trade |
+| Favorite-longshot bias | 1–8% (Snowberg-Wolfers 2010) | Empirical correction curve when populated |
+| Risk aversion | Hard to quantify | Live with it (creates persistent edge for risk-neutral systematic trader) |
+| Manipulation / informed flow | shocks persist 60d (arXiv 2503.03312) | This is what the flow engine *exploits* |
+| Liquidity / depth | Thin books drift from true p | Volume-weighted confidence in our estimate |
+| Oracle / settlement ambiguity | Rare but catastrophic | Skip markets with known oracle disputes |
+| Time-value of money (long-dated) | r·T | Apply discount factor for markets > 30d |
+
+**Implication:** the engine must NEVER use `c` as `p`. They are distinct inputs. If we ever wrote `p = mid_price`, the edge is mechanically zero and Kelly returns no trade. The whole reason path + flow + (eventual) external-data engines exist is to produce a `p_estimated` that *disagrees* with `c` in a defensible way.
+
+### Step 1: estimate `p_estimated`
+
+Options for producing `p_estimated`:
+- **Path-based:** project recent drift forward, with Brownian-bridge correction toward 0.5 if resolution is far
+- **Flow-based shrinkage:** if flow strongly agrees with a side, shrink `p_estimated` toward that side; if flow is balanced, *do not trade* — we have no information beyond the market
+- **External-data-based:** sports models, poll aggregations, ELO ratings — out of scope for v0
+
+For v0: blend `path_estimate` and `flow_estimate` with weights determined by confidence. **If both reduce to `c`, the system passes — no trade.**
+
+### Step 2: compute corrected expected value
+
 ```
-f* = (p − c) / (1 − c)        # for buying Yes at price c
+fee_cost          = expected_round_trip_fees(c, side, venue)
+slippage_cost     = expected_slippage(orderbook_depth, intended_size)
+discount_factor   = exp(-r · time_to_resolution_yrs)    # negligible for short markets
+
+expected_payoff_yes = discount_factor · 1.0            # if we win $1
+expected_payoff_no  = 0.0                              # if we lose, contract worth 0
+
+corrected_edge = p_estimated · expected_payoff_yes
+               + (1 - p_estimated) · expected_payoff_no
+               - c
+               - fee_cost
+               - slippage_cost
 ```
+
+Only proceed if `corrected_edge > 0`.
+
+### Step 3: compute Kelly fraction
+
+```
+f* = (p_estimated - c) / (1 - c)         # standard prediction-market Kelly
+                                          # (assumes unit payoff and uses RAW c, not fee-adjusted —
+                                          #  fees are handled in the size cap below)
+```
+
 If `f*` is negative, don't trade.
 
-**Step 3: apply fractional dampening.**
+### Step 4: apply fractional dampening and caps
+
 ```
-f = κ · f*    where κ = 0.25  (quarter-Kelly default; configurable)
+f = κ · f*                               # κ = 0.25 default (quarter-Kelly)
+f = min(f, max_single_market_exposure)   # default 5% of bankroll
 ```
 
-**Step 4: apply caps.**
-- Max single-market exposure: `f ≤ 0.05` (5% of bankroll per market regardless of Kelly)
-- Min trade size: skip if `f · bankroll < $5`
-- Slippage adjustment: reduce by expected slippage given orderbook depth
+Skip if `f · bankroll < min_trade_usd` (default $5) or if `corrected_edge < min_edge_threshold` (default 1¢).
 
-**Output:** `position_size_usd`, `entry_price`, `target_exit_price`, `stop_price`.
+**Output:** `position_size_usd`, `entry_price`, `target_exit_price`, `stop_price`, `p_estimated`, `corrected_edge`.
 
 ---
 
