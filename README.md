@@ -79,17 +79,27 @@ See `docs/research/papers.md` for the annotated bibliography. Key threads:
 | LMSR mechanism (legacy) | Hanson (2003) |
 | CLOB microstructure | SoK: Decentralized Prediction Markets (2025), arXiv 2510.15612 |
 
-## Data source
+## Data sources
 
-**Polymarket** — three free, no-key REST APIs + WebSocket:
+Two co-equal free sources from M1, both with auth-free read endpoints:
 
-- **Gamma API** (market metadata): markets, events, descriptions, end dates
-- **CLOB API** (trading + orderbook): `https://clob.polymarket.com` — orderbook, prices, spreads, trades
-- **Data API** (analytics): aggregated stats
+### Polymarket
+- **CLOB API** (`https://clob.polymarket.com`) — orderbook, prices, spreads, trades
+- **Gamma API** (`https://gamma-api.polymarket.com`) — market metadata, events, descriptions
+- **Data API** — aggregated analytics
+- Auth required *only* for placing orders. Reads are fully open.
+- Official `py-clob-client` Python wrapper.
 
-Auth is required only for placing orders. Read-only market data is fully open. The official `py-clob-client` package wraps the REST + WebSocket. See `docs/research/data_sources.md` for the adapter plan.
+### Kalshi
+- **REST v2** (`https://api.elections.kalshi.com/trade-api/v2`) — markets, events, orderbook, series, prices
+- **Demo sandbox** (`https://demo-api.kalshi.co`) for testing
+- Auth required *only* for trading. Read endpoints are public — no key needed.
+- CFTC-regulated US exchange, USD-denominated.
+- Rate limits: 30 req/sec public, 10 req/sec authenticated.
 
-Kalshi adapter to follow as a second source (CFTC-regulated, USD-denominated, requires account signup but free).
+Both work the same way from M1: pull market lists, snapshot orderbooks, archive trade tape. The adapter pattern keeps engine code identical regardless of source — cross-market arbitrage (M6) becomes a natural product of having both.
+
+See `docs/research/data_sources.md` for the full adapter plan.
 
 ## The path-trade in math
 
@@ -135,12 +145,12 @@ DriftEdge/
 
 ## Roadmap
 
-- **M1 — Polymarket ingestion (week 1).** Pull active markets via Gamma; pull orderbooks + trades via CLOB; persist to Parquet; log every fetch.
-- **M2 — Path engine (week 2).** Price-time-series features per market: momentum, realized vol, distance-to-entry-zone.
+- **M1 — Polymarket + Kalshi ingestion (week 1).** Pull active markets and orderbooks from both venues via their public read APIs; persist to Parquet; log every fetch.
+- **M2 — Path engine (week 2).** Price-time-series features per market: momentum, logit-vol, distance-to-entry-zone.
 - **M3 — Flow engine (week 3).** Volume z-scores, OB imbalance, large-trade detection. Adapt Chesney–Crameri–Mancini (2015) volume/OI logic to prediction-market trade flow.
 - **M4 — Sizing engine (week 4).** Kelly formula for prediction markets, fractional Kelly, slippage and fee modeling.
 - **M5 — Signal layer (week 5).** Combine path + flow + sizing into entry/exit/stop signals; log every decision; backtest on accumulated history.
-- **M6 — Cross-market arbitrage (later).** Kalshi adapter; detect mispricings between Polymarket and Kalshi on the same event.
+- **M6 — Cross-venue arbitrage.** Detect when Polymarket and Kalshi price the same event differently — exploit when spread exceeds combined slippage + withdrawal cost.
 - **M7 — Web UI (later).** Optional dashboard.
 
 ## Risk / Legal note

@@ -42,16 +42,55 @@ Not publicly documented as a hard number. Empirically, polling every 1-5 seconds
 
 ---
 
-## Kalshi — secondary source (M6)
+## Kalshi — co-equal M1 source
 
-CFTC-regulated US prediction market. USD-denominated.
+CFTC-regulated US prediction market. USD-denominated. **Public read endpoints require no auth**, so usable from M1 alongside Polymarket.
 
-- API requires account signup (free).
-- REST + WebSocket.
-- More limited market universe than Polymarket (no crypto, restrictions on certain categories).
-- Useful for cross-platform arbitrage and as a sanity-check on Polymarket pricing.
+### Base URLs
+- **Production REST**: `https://api.elections.kalshi.com/trade-api/v2`
+- **Demo sandbox**: `https://demo-api.kalshi.co/trade-api/v2`
 
-Out of scope until M6.
+### Read endpoints (no auth required)
+- `GET /markets` — list all markets with filters (status, event, series, ticker)
+- `GET /markets/{ticker}` — single market detail
+- `GET /markets/{ticker}/orderbook` — full L2 book (yes bids and no bids; Kalshi convention is to return both sides as bids, not bid/ask)
+- `GET /markets/{ticker}/trades` — recent trades
+- `GET /events` — list events (each contains 1+ markets)
+- `GET /events/{event_ticker}` — single event with all its markets
+- `GET /series` — series of recurring events
+- `GET /series/{series_ticker}` — single series
+
+### Authenticated endpoints (RSA-PSS signed; out of scope for M1)
+- Account info, portfolio, balance — requires auth
+- Order placement / cancellation — requires auth
+- Trade history (your own) — requires auth
+
+### Rate limits
+- **Public (read)**: ~30 req/sec
+- **Authenticated**: ~10 req/sec
+
+### Authentication (when we eventually trade)
+- RSA-PSS signed requests (more complex than Polymarket's HMAC-SHA256)
+- Generate key pair at https://kalshi.com/account/profile (Developer → API Keys)
+- Headers required: `KALSHI-ACCESS-KEY` (the Key ID), `KALSHI-ACCESS-SIGNATURE` (base64 of RSA-PSS sign of `timestamp + METHOD + path`), `KALSHI-ACCESS-TIMESTAMP` (ms epoch)
+- Private key never re-downloadable; download once and save securely
+- Python: `cryptography` library handles signing
+
+### Market structure note
+Kalshi markets are **binary by construction** with explicit Yes/No tokens. The orderbook returns "yes bids" and "no bids" rather than bid/ask. Conversion to a unified `(bid, ask)` per side requires the identity `ask_yes = 100 - best_no_bid` (prices are in cents 0–100, not 0.0–1.0).
+
+### Universe
+- Politics (elections, policy questions)
+- Climate / weather
+- Economics (CPI, Fed decisions, GDP)
+- Sports
+- Crypto and finance (subject to CFTC categorization)
+- NO general entertainment markets (more restricted than Polymarket)
+
+### Strategic value vs Polymarket
+- **Pros**: Regulated (less manipulation risk), USD-denominated (no on-chain friction), cleaner data, demo sandbox for testing
+- **Cons**: Smaller market universe, lower volume in most markets, US-only platform
+- **Cross-venue arbitrage**: When the same event is listed on both Polymarket and Kalshi (e.g., US election markets), spreads sometimes exceed combined fees/slippage. The M6 arb engine will exploit this.
 
 ---
 
@@ -85,7 +124,8 @@ These would inform the sizing engine when we want to actually estimate `p` beyon
 
 ## What this means for the build
 
-- **M1 ingestion** = Polymarket CLOB + Gamma only. No auth, no wallet.
-- **Archive starts at M1.** Every poll persisted. By M5 we should have weeks of orderbook and trade history.
+- **M1 ingestion** = Polymarket (CLOB + Gamma) **and** Kalshi (REST v2) in parallel. No auth, no wallet.
+- **Archive starts at M1.** Every poll persisted. By M5 we should have weeks of orderbook and trade history on both venues.
 - **No fabrication.** If a request fails, log it as missing. No interpolation in the data layer.
-- **Adapter pattern.** All sources implement the same interface so Kalshi/Manifold can drop in later.
+- **Adapter pattern.** Both sources implement the same interface (`list_markets`, `fetch_book`, `fetch_trades`, `fetch_price_history`). The engines downstream don't know which venue produced the data.
+- **Cross-venue identity mapping.** A small registry maps Polymarket market IDs ↔ Kalshi tickers where they cover the same event. This is required for M6 arb but built incrementally.

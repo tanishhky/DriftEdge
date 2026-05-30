@@ -33,9 +33,9 @@ class Config:
     polymarket_api_secret: Optional[str]
     polymarket_api_passphrase: Optional[str]
 
-    kalshi_email: Optional[str]
-    kalshi_password: Optional[str]
     kalshi_env: str
+    kalshi_api_key_id: Optional[str]
+    kalshi_private_key_path: Optional[Path]
 
 
 def load() -> Config:
@@ -56,7 +56,10 @@ def load() -> Config:
         polymarket_api_secret=os.getenv("POLYMARKET_API_SECRET") or None,
         polymarket_api_passphrase=os.getenv("POLYMARKET_API_PASSPHRASE") or None,
 
-        kalshi_email=os.getenv("KALSHI_EMAIL") or None,
-        kalshi_password=os.getenv("KALSHI_PASSWORD") or None,
-        kalshi_env=os.getenv("KALSHI_ENV", "demo"),
+        kalshi_env=os.getenv("KALSHI_ENV", "prod"),
+        kalshi_api_key_id=os.getenv("KALSHI_API_KEY_ID") or None,
+        kalshi_private_key_path=(
+            Path(os.getenv("KALSHI_PRIVATE_KEY_PATH")).resolve()
+            if os.getenv("KALSHI_PRIVATE_KEY_PATH") else None
+        ),
     )
