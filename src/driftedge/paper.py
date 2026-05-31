@@ -182,20 +182,22 @@ def should_close(book: BookTop, position: dict,
 # ── Position lifecycle ───────────────────────────────────────────────────
 
 def open_position(market: dict, book: BookTop, rule: EntryRule,
-                  as_of_ts: str) -> dict:
+                  as_of_ts: str, *, trader: str, size_usd: float,
+                  venue: str = "polymarket") -> dict:
     """Construct a new position dict. Pure — no side effects."""
     assert book.snapshot_ts <= as_of_ts, "lookahead in open_position"
     return {
         "trade_id": str(uuid.uuid4()),
-        "venue": "polymarket",
+        "trader": trader,
+        "venue": venue,
         "market_id": str(market.get("market_id", "")),
         "question": market.get("question", ""),
         "yes_token_id": market.get("yes_token_id"),
         "entry_ts": as_of_ts,
         "entry_snapshot_ts": book.snapshot_ts,
         "entry_price": book.best_ask,
-        "entry_size_usd": rule.notional_usd,
-        "shares": rule.notional_usd / book.best_ask if book.best_ask > 0 else 0.0,
+        "entry_size_usd": size_usd,
+        "shares": size_usd / book.best_ask if book.best_ask > 0 else 0.0,
         "target": rule.target,
         "stop": rule.stop,
         "status": "open",
@@ -215,6 +217,7 @@ def close_position(position: dict, book: BookTop, reason: str,
     closed = dict(position)
     exit_price = book.best_bid  # we SELL at the bid (conservative)
     pnl_per_share = exit_price - position["entry_price"]
+    pnl_usd = pnl_per_share * position.get("shares", 0.0)
     closed.update({
         "exit_ts": as_of_ts,
         "exit_snapshot_ts": book.snapshot_ts,
@@ -222,7 +225,7 @@ def close_position(position: dict, book: BookTop, reason: str,
         "exit_reason": reason,
         "status": f"closed_{reason}",
         "pnl_per_share": pnl_per_share,
-        "pnl_usd": pnl_per_share * position.get("shares", 0.0),
+        "pnl_usd": pnl_usd,
     })
     return closed
 
@@ -230,27 +233,39 @@ def close_position(position: dict, book: BookTop, reason: str,
 # ── Tick driver (uses the daemon's data dir) ─────────────────────────────
 
 def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
-         as_of_ts: Optional[str] = None) -> dict:
-    """Run one paper-trading evaluation cycle.
+         as_of_ts: Optional[str] = None,
+         bankroll: float = 10000.0) -> dict:
+    """Run one paper-trading evaluation cycle for ALL traders.
 
-    For each market in `markets`:
-      * load the latest book snapshot with snapshot_ts <= as_of_ts
-      * if we have no open position on this market and should_open → open
-      * if we have an open position and should_close → close
+    Three independent traders (kelly, equal, volwt) each see the same
+    markets via the same entry/exit triggers, but size positions
+    differently. The lookahead discipline applies to all of them: every
+    snapshot read is filtered to snapshot_ts <= as_of_ts.
 
-    Returns a summary dict.
+    Returns a per-trader summary dict.
     """
     if as_of_ts is None:
         as_of_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     from .data import paper_persist as pp
+    from .data import state_persist as sp
+    from . import sizing
+
+    # Initialise per-trader state if first run; load otherwise.
+    states = sp.init_state(data_dir, bankroll=bankroll)
+
     positions = pp.load_positions(data_dir)
-    open_by_market = {
-        p["market_id"]: p for p in positions if p.get("status") == "open"
+    # Key positions by (trader, market_id) so each trader has its own book.
+    open_by_key = {
+        (p.get("trader"), p.get("market_id")): p
+        for p in positions if p.get("status") == "open"
     }
 
     opened, closed = [], []
     books_dir = data_dir / "books" / "polymarket"
+
+    per_trader_opened: dict[str, int] = {t: 0 for t in sizing.trader_labels()}
+    per_trader_closed: dict[str, int] = {t: 0 for t in sizing.trader_labels()}
 
     for m in markets:
         mid = str(m.get("market_id") or "")
@@ -260,24 +275,51 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
         if book is None:
             continue
 
-        if mid in open_by_market:
-            reason = should_close(book, open_by_market[mid], rule, as_of_ts,
+        # ── EXIT side first (frees up capital before evaluating new opens) ──
+        for trader_id in sizing.trader_labels():
+            existing = open_by_key.get((trader_id, mid))
+            if existing is None:
+                continue
+            reason = should_close(book, existing, rule, as_of_ts,
                                   resolution_ts=m.get("end_date"))
             if reason:
-                closed_pos = close_position(open_by_market[mid], book, reason, as_of_ts)
+                closed_pos = close_position(existing, book, reason, as_of_ts)
                 closed.append(closed_pos)
-        else:
-            if should_open(book, rule, as_of_ts=as_of_ts,
+                per_trader_closed[trader_id] += 1
+                # Update in-memory state so subsequent opens see freed capital.
+                size_usd = float(existing.get("entry_size_usd", 0.0))
+                pnl_usd = float(closed_pos.get("pnl_usd", 0.0))
+                states[trader_id] = sp.apply_close(states[trader_id],
+                                                   size_usd, pnl_usd)
+                # Remove from open key so we don't try to close again.
+                del open_by_key[(trader_id, mid)]
+
+        # ── ENTRY side ──
+        if not should_open(book, rule, as_of_ts=as_of_ts,
                            resolution_ts=m.get("end_date")):
-                new_pos = open_position(m, book, rule, as_of_ts)
-                opened.append(new_pos)
+            continue
+        for trader_id, sizer_fn in sizing.SIZERS.items():
+            if (trader_id, mid) in open_by_key:
+                continue  # already in
+            size_usd = sizer_fn(states[trader_id], c=book.best_ask,
+                                target=rule.target, stop=rule.stop)
+            if size_usd <= 0:
+                continue
+            new_pos = open_position(m, book, rule, as_of_ts,
+                                    trader=trader_id, size_usd=size_usd)
+            opened.append(new_pos)
+            per_trader_opened[trader_id] += 1
+            states[trader_id] = sp.apply_open(states[trader_id], size_usd)
 
     if opened or closed:
         pp.upsert_positions(data_dir, opened=opened, closed=closed)
+        sp.save_state(data_dir, states)
 
     obs.event(channel="fit", kind="paper.tick", level="INFO",
               as_of_ts=as_of_ts, markets_seen=len(markets),
-              opened=len(opened), closed=len(closed),
-              total_open=len(open_by_market) + len(opened) - len(closed))
+              opened_by_trader=per_trader_opened,
+              closed_by_trader=per_trader_closed)
 
-    return {"as_of_ts": as_of_ts, "opened": len(opened), "closed": len(closed)}
+    return {"as_of_ts": as_of_ts,
+            "opened_by_trader": per_trader_opened,
+            "closed_by_trader": per_trader_closed}

@@ -110,3 +110,32 @@ def test_close_assertion_blocks_lookahead():
         assert "lookahead" in str(exc)
         return
     raise AssertionError("close_position did not detect the lookahead")
+
+
+def test_open_position_carries_trader_and_size():
+    """Open position must record trader and size_usd."""
+    rule = EntryRule()
+    book = BookTop(snapshot_ts="2026-05-30T10:00:00",
+                   best_bid=0.34, best_ask=0.35,
+                   bid_depth=100, ask_depth=100)
+    market = {"market_id": "M1", "question": "Will X happen?"}
+    pos = open_position(market, book, rule, as_of_ts="2026-05-30T10:00:00",
+                        trader="kelly", size_usd=187.5)
+    assert pos["trader"] == "kelly"
+    assert pos["entry_size_usd"] == 187.5
+    assert pos["shares"] > 0
+
+
+def test_three_sizers_produce_different_amounts():
+    """Sanity: the three sizers should not all return identical sizes."""
+    from driftedge.sizing import (
+        TraderState, kelly_size, equal_weight_size, vol_weighted_size,
+    )
+    s = TraderState(trader="t", bankroll_init=10000.0, cash_usd=10000.0,
+                    open_exposure=0.0, closed_pnl=0.0)
+    k = kelly_size(s, c=0.36, target=0.60, stop=0.20)
+    e = equal_weight_size(s, c=0.36, target=0.60, stop=0.20)
+    v = vol_weighted_size(s, c=0.36, target=0.60, stop=0.20)
+    assert k > 0 and e > 0 and v > 0
+    # All capped at 2% of bankroll = $200
+    assert max(k, e, v) <= 200.01
