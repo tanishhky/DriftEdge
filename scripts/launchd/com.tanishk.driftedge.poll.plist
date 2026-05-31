@@ -7,11 +7,11 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/tanishkyadav/Documents/SecondBrain/GitHub/DriftEdge/scripts/driftedge-poll.sh</string>
+        <string>/Users/tanishkyadav/dev/DriftEdge/scripts/driftedge-poll.sh</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/tanishkyadav/Documents/SecondBrain/GitHub/DriftEdge</string>
+    <string>/Users/tanishkyadav/dev/DriftEdge</string>
 
     <!-- Start immediately on load and on login -->
     <key>RunAtLoad</key>
@@ -28,9 +28,9 @@
     <integer>60</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/tanishkyadav/Documents/SecondBrain/GitHub/DriftEdge/logs/launchd-poll.out</string>
+    <string>/Users/tanishkyadav/dev/DriftEdge/logs/launchd-poll.out</string>
     <key>StandardErrorPath</key>
-    <string>/Users/tanishkyadav/Documents/SecondBrain/GitHub/DriftEdge/logs/launchd-poll.err</string>
+    <string>/Users/tanishkyadav/dev/DriftEdge/logs/launchd-poll.err</string>
 
     <key>EnvironmentVariables</key>
     <dict>

@@ -17,6 +17,7 @@ from typing import Any
 
 from . import config as cfg
 from . import obs
+from . import paper
 from .data import normalize, persistence
 from .data.polymarket import PolymarketClient, PolymarketError
 
@@ -128,6 +129,22 @@ def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
                 # be polite — don't hammer
                 time.sleep(0.3)
 
+            # Paper-trading tick — strictly uses as_of_ts=now so it sees
+            # only the snapshots we just wrote, never anything labelled
+            # in the future.
+            try:
+                rule = paper.EntryRule(
+                    entry_low=c.entry_low,
+                    entry_high=c.entry_high,
+                    target=c.exit_target,
+                    stop=c.stop_low,
+                )
+                paper.tick(c.data_dir, tracked, rule)
+            except Exception as exc:
+                obs.event(channel="error", kind="paper.tick_fail",
+                          level="WARNING", err=str(exc),
+                          exc_type=type(exc).__name__)
+
             iteration += 1
             obs.event(channel="run", kind="poll.iteration_done",
                       level="DEBUG", iteration=iteration,
@@ -168,7 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
     fb.set_defaults(func=cmd_fetch_orderbook)
 
     pl = sub.add_parser("poll",
-                        help="Long-running daemon: markets + orderbooks")
+                        help="Long-running daemon: markets + orderbooks + paper tick")
     pl.add_argument("--top-n", type=int, default=20,
                     help="Number of top-by-volume markets to track (default 20)")
     pl.add_argument("--book-interval-s", type=int, default=30,
@@ -177,7 +194,34 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Seconds between market-list refreshes (default 300)")
     pl.set_defaults(func=cmd_poll)
 
+    pt = sub.add_parser("paper-tick",
+                        help="Run one paper-trading evaluation cycle (no-lookahead).")
+    pt.set_defaults(func=cmd_paper_tick)
+
     return p
+
+
+def cmd_paper_tick(_: argparse.Namespace, c: cfg.Config) -> int:
+    """One-off paper tick — useful for testing or manual triggers."""
+    client = PolymarketClient()
+    try:
+        payload = client.list_markets(limit=60)
+    except PolymarketError as exc:
+        obs.event(channel="run", kind="paper.tick_fetch_fail",
+                  level="ERROR", err=str(exc))
+        return 1
+    df = normalize.normalize_polymarket_markets(payload)
+    df = df.dropna(subset=["yes_token_id"])
+    df = df[(df["active"] == True) & (df["closed"] == False)]
+    tracked = df.head(20).to_dict("records")
+    rule = paper.EntryRule(
+        entry_low=c.entry_low, entry_high=c.entry_high,
+        target=c.exit_target, stop=c.stop_low,
+    )
+    result = paper.tick(c.data_dir, tracked, rule)
+    obs.event(channel="run", kind="paper.tick.cli_done",
+              level="INFO", **result)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

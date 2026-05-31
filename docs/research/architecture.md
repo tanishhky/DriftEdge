@@ -186,6 +186,24 @@ Every signal is logged to `logs/signals.jsonl` regardless of whether it fires. T
 
 ---
 
+## 5b. Paper-trading layer (minimal, shipped)
+
+A lookahead-safe paper-trading engine runs on every poll iteration. Lives in `src/driftedge/paper.py`, persists to `data/paper_trades.parquet`.
+
+**Decision rule (v0)** — for each tracked market on each tick:
+- **Open** a paper-long Yes position when `entry_low ≤ best_ask ≤ entry_high` AND the market is not within `force_exit_hours_before_resolution`.
+- **Close** when `best_bid ≥ target` (take profit) OR `best_bid ≤ stop` (stop loss) OR `time_to_resolution < force_exit_hours_before_resolution` (force exit before event variance).
+
+Position size is fixed notional (`$100` default). Kelly sizing with `p_estimated` replaces this once the path engine (M2) is online.
+
+**Strict no-lookahead** — see ADR 0004:
+- All snapshot reads filter `snapshot_ts <= as_of_ts`.
+- Decision/lifecycle functions take `as_of_ts` explicitly.
+- Assertions in `open_position` and `close_position` raise if `book.snapshot_ts > as_of_ts`.
+- `tests/test_paper_no_lookahead.py` proves that injecting future-dated data into the store does not change past decisions.
+
+---
+
 ## 6. Logging discipline
 
 Same as PinSight: every fetch, fit, score, signal goes to JSONL with timestamp, channel, duration, status. The `obs` module is copied/adapted from PinSight directly.

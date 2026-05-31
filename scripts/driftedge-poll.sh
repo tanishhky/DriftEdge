@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-PROJECT="/Users/tanishkyadav/Documents/SecondBrain/GitHub/DriftEdge"
+PROJECT="/Users/tanishkyadav/dev/DriftEdge"
 PY="${PROJECT}/.venv/bin/python"
 
 cd "$PROJECT"
