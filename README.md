@@ -14,7 +14,56 @@ That's a 24-cent move on a 36-cent ticket (+67% return) without taking event var
 
 ## Status
 
-Pre-alpha. Scaffold + research foundation only. Nothing trades yet.
+**M1-M5 shipped (2026-05-30 to 2026-05-31):** Polymarket ingestion, normalized Parquet persistence, continuous polling daemon, paper-trading engine with strict no-lookahead enforcement (ADR 0004), and a **3-trader sizing horse race** (Kelly + Equal-Wt + Vol-Wt) each running with $10,000 paper bankrolls. Kalshi adapter built but not yet wired into polling (M6).
+
+**Known v0 limitation:** entry/target/stop thresholds (`[0.30, 0.40]` entry, `0.60` target, `0.20` stop) are currently **hardcoded**, not computed from market statistics. The proper version (per-market confidence intervals from observed price history) is on the roadmap. See ADR 0003 for the price-vs-probability discipline that keeps this swap clean.
+
+**Operationally:** the project lives at `~/dev/DriftEdge/`. A `KeepAlive` launchd job polls Polymarket continuously (markets every 5 min, top-20 orderbooks every 30 s) and runs paper decisions on every tick.
+
+## What's wired up today
+
+| Component | Status |
+|---|---|
+| `driftedge ping` / `fetch-markets` / `fetch-orderbook` / `paper-tick` / `poll` | shipped |
+| Polymarket adapter (Gamma + CLOB read endpoints, no auth required) | shipped |
+| Kalshi adapter (REST v2 read methods + RSA-PSS signing scaffold) | shipped, **not yet integrated into polling** |
+| Normalization layer (uniform DataFrame schema across venues) | shipped |
+| Parquet persistence (markets snapshots, orderbook snapshots, trades) | shipped |
+| Continuous polling daemon (launchd KeepAlive) | shipped |
+| Paper-trading engine, lookahead-safe by construction | shipped |
+| 3-trader sizing engine (Kelly + Equal + Vol-Wt) | shipped |
+| Per-trader portfolio state (bankroll, cash, exposure, drawdown, peak equity) | shipped |
+| Near-resolution-market filter in polling loop | shipped |
+| Skip-on-resolution-window in `should_open` | shipped |
+| Path engine (logit drift + vol features) | planned (M2) |
+| Flow engine (OB imbalance, volume z-scores) | planned (M3) |
+| Computed entry/target/stop from market history | planned |
+| Cross-venue arbitrage (Polymarket ↔ Kalshi) | planned (M6) |
+
+## The 3-trader paper-trading horse race
+
+Three independent sizers each operate on the same entry/exit triggers but with different position-sizing logic. Each gets $10,000 starting paper bankroll. The winner is whichever finishes the highest equity with reasonable drawdown.
+
+| Trader | Sizing rule |
+|---|---|
+| **Kelly** | Quarter-Kelly with conservative `p_estimated = 0.45`. Smaller positions on smaller edges; built so swapping `p_estimated` for path-engine output is a one-line change. |
+| **Equal-Wt** | Fixed 2 % of bankroll per position (max single exposure cap). The "naive diversifier" baseline. |
+| **Vol-Wt** | Inverse-Bernoulli-stddev weighted. Slight tilt toward extreme prices vs. mid-band. Risk-parity for binary contracts. |
+
+Shared caps applied to all three: 2 % per position, 50 % aggregate exposure, $5 min trade.
+
+## No-lookahead enforcement (ADR 0004)
+
+Every function that reads historical data takes an explicit `as_of_ts` parameter and filters reads to `snapshot_ts <= as_of_ts`. Position math asserts `book.snapshot_ts <= as_of_ts`. `tests/test_paper_no_lookahead.py` proves invariance under future-data injection (5/5 tests passing).
+
+## Install / install autorun
+
+```
+cd ~/dev/DriftEdge
+python3 -m venv .venv
+.venv/bin/pip install -e .
+./scripts/launchd/install.sh    # starts continuous poll daemon
+```
 
 ## Why this works in theory
 

@@ -60,14 +60,19 @@ def event(channel: str, kind: str, level: str = "INFO", **fields: Any) -> None:
         **fields,
     }
 
-    path = _LOG_DIR / f"{channel}-{_today()}.jsonl"
-    try:
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, default=str) + "\n")
-    except OSError as exc:
-        _console.print(f"[red]obs write failed:[/red] {exc}")
+    # Filter file writes by configured level (DEBUG events skipped at INFO+).
+    level_num = _LEVELS.get(level, 20)
+    configured_num = _LEVELS.get(_LEVEL, 20)
 
-    if _LEVELS.get(level, 20) >= _LEVELS.get(_LEVEL, 20):
+    if level_num >= configured_num:
+        path = _LOG_DIR / f"{channel}-{_today()}.jsonl"
+        try:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, default=str) + "\n")
+        except OSError as exc:
+            _console.print(f"[red]obs write failed:[/red] {exc}")
+
+    if level_num >= configured_num:
         colour = {"DEBUG": "dim", "INFO": "cyan", "WARNING": "yellow", "ERROR": "red"}.get(level, "")
         _console.print(
             f"[{colour}]{level:<7}[/{colour}] [bold]{channel}[/bold] {kind}",
@@ -87,7 +92,11 @@ class Timed:
 
 
 @contextmanager
-def timed(channel: str, kind: str, **start_fields: Any) -> Iterator[Timed]:
+def timed(channel: str, kind: str, done_level: str = "INFO",
+          **start_fields: Any) -> Iterator[Timed]:
+    """Time a block. `done_level` controls the success-event log level
+    (use 'DEBUG' for noisy per-call instrumentation; INFO for events
+    worth keeping in the day-to-day log)."""
     t = Timed(kind=kind, channel=channel)
     event(channel=channel, kind=f"{kind}.start", level="DEBUG", **start_fields)
     try:
@@ -111,7 +120,7 @@ def timed(channel: str, kind: str, **start_fields: Any) -> Iterator[Timed]:
         event(
             channel=channel,
             kind=f"{kind}.done",
-            level="INFO",
+            level=done_level,
             duration_ms=round(elapsed_ms, 2),
             **start_fields,
             **t.extra,

@@ -97,18 +97,41 @@ def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
         now = time.time()
         try:
             if now - last_market_refresh >= args.market_refresh_s:
-                payload = client.list_markets(limit=args.top_n * 3)
+                payload = client.list_markets(limit=args.top_n * 4)
                 df = normalize.normalize_polymarket_markets(payload)
                 persistence.write_markets_snapshot(df, c.data_dir,
                                                    venue="polymarket")
                 df = df.dropna(subset=["yes_token_id"])
                 df = df[(df["active"] == True) & (df["closed"] == False)]
+
+                # Skip markets too close to resolution — we can't open a
+                # new position there anyway (force-exit window), so polling
+                # their books is waste.
+                now_utc = datetime.now(timezone.utc)
+                horizon_h = c.force_exit_hours_before_resolution if hasattr(
+                    c, "force_exit_hours_before_resolution") else 6.0
+
+                def _has_tradeable_window(end_date_str: Any) -> bool:
+                    if not end_date_str:
+                        return True
+                    try:
+                        end = datetime.fromisoformat(
+                            str(end_date_str).replace("Z", "+00:00"))
+                        return (end - now_utc).total_seconds() / 3600.0 >= horizon_h
+                    except (ValueError, TypeError):
+                        return True
+
+                before_filter = len(df)
+                df = df[df["end_date"].apply(_has_tradeable_window)]
+                after_filter = len(df)
+
                 tracked = (df.sort_values("volume_24h", ascending=False)
                              .head(args.top_n)
                              .to_dict("records"))
                 last_market_refresh = now
                 obs.event(channel="run", kind="poll.tracked_refresh",
-                          level="INFO", tracked=len(tracked))
+                          level="INFO", tracked=len(tracked),
+                          filtered_near_resolution=before_filter - after_filter)
 
             for m in tracked:
                 if stop["flag"]:

@@ -42,8 +42,8 @@ class PolymarketClient:
     def _get(self, base: str, path: str,
              params: Optional[dict[str, Any]] = None) -> Any:
         url = f"{base}{path}"
-        with obs.timed("api", "polymarket.get", endpoint=path,
-                       params=params, base=base) as t:
+        with obs.timed("api", "polymarket.get", done_level="DEBUG",
+                       endpoint=path, params=params, base=base) as t:
             try:
                 resp = self._session.get(url, params=params, timeout=self._timeout)
             except requests.RequestException as exc:
