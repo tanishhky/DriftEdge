@@ -7,6 +7,11 @@ markets DataFrame columns:
     yes_token_id, no_token_id, volume_24h, volume_total,
     liquidity, best_bid_yes, best_ask_yes, last_price
 
+If data_dir is passed to normalize_*_markets, each new market is
+classified once via classifier.classify_and_cache() and the decision
+persisted to market_categories.parquet. Subsequent fetches read the
+cached category — the classifier is never rerun on a known market.
+
 trades DataFrame columns:
     id, market_id, ts, price, size, side, taker_side
 """
@@ -14,6 +19,7 @@ trades DataFrame columns:
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
@@ -76,19 +82,32 @@ def _outcome_prices(market: dict) -> tuple[Optional[float], Optional[float]]:
     return _f(prices[0]), _f(prices[1])
 
 
-def normalize_polymarket_markets(payload: list[dict]) -> pd.DataFrame:
-    """Flatten Polymarket Gamma /markets response."""
-    from ..categorize import categorize_question
+def normalize_polymarket_markets(payload: list[dict],
+                                 data_dir: Optional[Path] = None) -> pd.DataFrame:
+    """Flatten Polymarket Gamma /markets response.
+
+    If data_dir is provided, categorization goes through the persistent
+    classify-once cache (classifier.classify_and_cache).
+    """
+    if data_dir is not None:
+        from ..classifier import classify_and_cache
     rows: list[dict] = []
     for m in payload:
         yes_token, no_token = _tokens(m)
         yes_label, no_label = _outcomes(m)
         yes_price, no_price = _outcome_prices(m)
         question = m.get("question")
-        # Polymarket's category field is empty for most markets in practice.
-        # Use the API value if present; otherwise keyword-classify the question.
+        market_id = str(m.get("id") or m.get("conditionId") or "")
         api_cat = m.get("category")
-        category = api_cat if api_cat else categorize_question(question)
+        if api_cat:
+            category = api_cat
+        elif data_dir is not None and market_id:
+            cls = classify_and_cache(data_dir, venue="polymarket",
+                                     market_id=market_id, question=question)
+            category = cls.category
+        else:
+            from ..categorize import categorize_question
+            category = categorize_question(question)
         rows.append({
             "venue": "polymarket",
             "market_id": str(m.get("id") or m.get("conditionId") or ""),
@@ -139,13 +158,19 @@ def normalize_polymarket_trades(payload: list[dict],
     return pd.DataFrame(rows)
 
 
-def normalize_kalshi_markets(payload: dict) -> pd.DataFrame:
+def normalize_kalshi_markets(payload: dict,
+                              data_dir: Optional[Path] = None) -> pd.DataFrame:
     """Flatten Kalshi /markets response. Prices already in USD (0.0-1.0)."""
-    from ..categorize import categorize_question
+    if data_dir is not None:
+        from ..classifier import classify_and_cache
+    else:
+        from ..categorize import categorize_kalshi_ticker
     rows: list[dict] = []
     markets = payload.get("markets", []) if isinstance(payload, dict) else []
     for m in markets:
         title = m.get("title") or m.get("yes_sub_title")
+        ticker = m.get("ticker")
+        event_ticker = m.get("event_ticker")
         yes_bid = _f(m.get("yes_bid_dollars"))
         yes_ask = _f(m.get("yes_ask_dollars"))
         if yes_bid is not None and yes_ask is not None:
@@ -155,13 +180,21 @@ def normalize_kalshi_markets(payload: dict) -> pd.DataFrame:
         no_price = (1.0 - yes_price) if yes_price is not None else None
         spread = (yes_ask - yes_bid) if (yes_ask is not None and yes_bid is not None) else None
 
+        if data_dir is not None and ticker:
+            cls = classify_and_cache(data_dir, venue="kalshi",
+                                     market_id=ticker, question=title,
+                                     event_ticker=event_ticker)
+            category = cls.category
+        else:
+            category = categorize_kalshi_ticker(ticker, event_ticker, title)
+
         rows.append({
             "venue": "kalshi",
-            "market_id": m.get("ticker"),
-            "condition_id": m.get("event_ticker"),
-            "slug": m.get("ticker"),
+            "market_id": ticker,
+            "condition_id": event_ticker,
+            "slug": ticker,
             "question": title,
-            "category": categorize_question(title) if title else "other",
+            "category": category,
             "end_date": m.get("close_time") or m.get("expiration_time"),
             "yes_token_id": m.get("ticker"),
             "no_token_id": None,

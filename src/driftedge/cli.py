@@ -116,7 +116,8 @@ def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
                 # ── POLYMARKET refresh ──
                 try:
                     payload = client.list_markets(limit=args.top_n * 4)
-                    df = normalize.normalize_polymarket_markets(payload)
+                    df = normalize.normalize_polymarket_markets(
+                        payload, data_dir=c.data_dir)
                     persistence.write_markets_snapshot(df, c.data_dir,
                                                        venue="polymarket")
                     df = df.dropna(subset=["yes_token_id"])
@@ -138,7 +139,8 @@ def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
                 try:
                     kpayload = kalshi.list_markets(status="open",
                                                     limit=min(args.top_n * 4, 200))
-                    kdf = normalize.normalize_kalshi_markets(kpayload)
+                    kdf = normalize.normalize_kalshi_markets(
+                        kpayload, data_dir=c.data_dir)
                     persistence.write_markets_snapshot(kdf, c.data_dir,
                                                        venue="kalshi")
                     kdf = kdf[kdf["active"] == True]
