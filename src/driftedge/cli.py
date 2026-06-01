@@ -20,6 +20,7 @@ from . import obs
 from . import paper
 from .data import normalize, persistence
 from .data.polymarket import PolymarketClient, PolymarketError
+from .data.kalshi import KalshiClient, KalshiError
 
 
 # ---------- subcommands ----------
@@ -79,6 +80,7 @@ def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
               market_refresh_s=args.market_refresh_s)
 
     client = PolymarketClient()
+    kalshi = KalshiClient(env="prod")
     stop = {"flag": False}
 
     def _shutdown(signum, frame):
@@ -89,51 +91,83 @@ def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    tracked: list[dict[str, Any]] = []
+    tracked_poly: list[dict[str, Any]] = []
+    tracked_kalshi: list[dict[str, Any]] = []
     last_market_refresh = 0.0
     iteration = 0
+
+    def _has_tradeable_window(end_date_str: Any, now_utc: datetime,
+                               horizon_h: float) -> bool:
+        if not end_date_str:
+            return True
+        try:
+            end = datetime.fromisoformat(str(end_date_str).replace("Z", "+00:00"))
+            return (end - now_utc).total_seconds() / 3600.0 >= horizon_h
+        except (ValueError, TypeError):
+            return True
 
     while not stop["flag"]:
         now = time.time()
         try:
             if now - last_market_refresh >= args.market_refresh_s:
-                payload = client.list_markets(limit=args.top_n * 4)
-                df = normalize.normalize_polymarket_markets(payload)
-                persistence.write_markets_snapshot(df, c.data_dir,
-                                                   venue="polymarket")
-                df = df.dropna(subset=["yes_token_id"])
-                df = df[(df["active"] == True) & (df["closed"] == False)]
-
-                # Skip markets too close to resolution — we can't open a
-                # new position there anyway (force-exit window), so polling
-                # their books is waste.
                 now_utc = datetime.now(timezone.utc)
-                horizon_h = c.force_exit_hours_before_resolution if hasattr(
-                    c, "force_exit_hours_before_resolution") else 6.0
+                horizon_h = 6.0
 
-                def _has_tradeable_window(end_date_str: Any) -> bool:
-                    if not end_date_str:
-                        return True
-                    try:
-                        end = datetime.fromisoformat(
-                            str(end_date_str).replace("Z", "+00:00"))
-                        return (end - now_utc).total_seconds() / 3600.0 >= horizon_h
-                    except (ValueError, TypeError):
-                        return True
+                # ── POLYMARKET refresh ──
+                try:
+                    payload = client.list_markets(limit=args.top_n * 4)
+                    df = normalize.normalize_polymarket_markets(payload)
+                    persistence.write_markets_snapshot(df, c.data_dir,
+                                                       venue="polymarket")
+                    df = df.dropna(subset=["yes_token_id"])
+                    df = df[(df["active"] == True) & (df["closed"] == False)]
+                    before = len(df)
+                    df = df[df["end_date"].apply(
+                        lambda s: _has_tradeable_window(s, now_utc, horizon_h))]
+                    tracked_poly = (df.sort_values("volume_24h", ascending=False)
+                                      .head(args.top_n).to_dict("records"))
+                    obs.event(channel="run", kind="poll.tracked_refresh",
+                              level="INFO", venue="polymarket",
+                              tracked=len(tracked_poly),
+                              filtered_near_resolution=before - len(df))
+                except PolymarketError as exc:
+                    obs.event(channel="error", kind="poll.markets_fail",
+                              level="WARNING", venue="polymarket", err=str(exc))
 
-                before_filter = len(df)
-                df = df[df["end_date"].apply(_has_tradeable_window)]
-                after_filter = len(df)
+                # ── KALSHI refresh ──
+                try:
+                    kpayload = kalshi.list_markets(status="open",
+                                                    limit=min(args.top_n * 4, 200))
+                    kdf = normalize.normalize_kalshi_markets(kpayload)
+                    persistence.write_markets_snapshot(kdf, c.data_dir,
+                                                       venue="kalshi")
+                    kdf = kdf[kdf["active"] == True]
+                    # Need a tradeable spread (best_ask present)
+                    kdf = kdf.dropna(subset=["best_ask"])
+                    before_k = len(kdf)
+                    kdf = kdf[kdf["end_date"].apply(
+                        lambda s: _has_tradeable_window(s, now_utc, horizon_h))]
+                    # Kalshi volumes often 0 for new markets; sort by volume but
+                    # fall back to liquidity.
+                    sort_col = "volume_24h" if (
+                        not kdf.empty and kdf["volume_24h"].fillna(0).sum() > 0
+                    ) else "liquidity"
+                    tracked_kalshi = (kdf.sort_values(sort_col, ascending=False,
+                                                      na_position="last")
+                                         .head(args.top_n).to_dict("records"))
+                    obs.event(channel="run", kind="poll.tracked_refresh",
+                              level="INFO", venue="kalshi",
+                              tracked=len(tracked_kalshi),
+                              filtered_near_resolution=before_k - len(kdf),
+                              sort_col=sort_col)
+                except KalshiError as exc:
+                    obs.event(channel="error", kind="poll.markets_fail",
+                              level="WARNING", venue="kalshi", err=str(exc))
 
-                tracked = (df.sort_values("volume_24h", ascending=False)
-                             .head(args.top_n)
-                             .to_dict("records"))
                 last_market_refresh = now
-                obs.event(channel="run", kind="poll.tracked_refresh",
-                          level="INFO", tracked=len(tracked),
-                          filtered_near_resolution=before_filter - after_filter)
 
-            for m in tracked:
+            # ── ORDERBOOK snapshots: Polymarket ──
+            for m in tracked_poly:
                 if stop["flag"]:
                     break
                 token_id = m.get("yes_token_id")
@@ -147,14 +181,32 @@ def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
                         market_id=market_id, token_id=token_id)
                 except PolymarketError as exc:
                     obs.event(channel="error", kind="poll.book_fail",
-                              level="WARNING", market_id=market_id,
-                              err=str(exc))
-                # be polite — don't hammer
+                              level="WARNING", venue="polymarket",
+                              market_id=market_id, err=str(exc))
                 time.sleep(0.3)
+
+            # ── ORDERBOOK snapshots: Kalshi ──
+            for m in tracked_kalshi:
+                if stop["flag"]:
+                    break
+                ticker = m.get("market_id")
+                if not ticker:
+                    continue
+                try:
+                    raw = kalshi.get_orderbook(ticker, depth=20)
+                    normalized = normalize.normalize_kalshi_orderbook(raw)
+                    persistence.write_orderbook_snapshot(
+                        normalized, c.data_dir, venue="kalshi",
+                        market_id=ticker, token_id=ticker)
+                except KalshiError as exc:
+                    obs.event(channel="error", kind="poll.book_fail",
+                              level="WARNING", venue="kalshi",
+                              market_id=ticker, err=str(exc))
+                time.sleep(0.15)  # Kalshi 30 req/sec public; can be faster
 
             # Paper-trading tick — strictly uses as_of_ts=now so it sees
             # only the snapshots we just wrote, never anything labelled
-            # in the future.
+            # in the future. Now sees BOTH venues.
             try:
                 rule = paper.EntryRule(
                     entry_low=c.entry_low,
@@ -162,7 +214,8 @@ def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
                     target=c.exit_target,
                     stop=c.stop_low,
                 )
-                paper.tick(c.data_dir, tracked, rule)
+                all_markets = tracked_poly + tracked_kalshi
+                paper.tick(c.data_dir, all_markets, rule)
             except Exception as exc:
                 obs.event(channel="error", kind="paper.tick_fail",
                           level="WARNING", err=str(exc),

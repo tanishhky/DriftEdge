@@ -78,18 +78,24 @@ def _outcome_prices(market: dict) -> tuple[Optional[float], Optional[float]]:
 
 def normalize_polymarket_markets(payload: list[dict]) -> pd.DataFrame:
     """Flatten Polymarket Gamma /markets response."""
+    from ..categorize import categorize_question
     rows: list[dict] = []
     for m in payload:
         yes_token, no_token = _tokens(m)
         yes_label, no_label = _outcomes(m)
         yes_price, no_price = _outcome_prices(m)
+        question = m.get("question")
+        # Polymarket's category field is empty for most markets in practice.
+        # Use the API value if present; otherwise keyword-classify the question.
+        api_cat = m.get("category")
+        category = api_cat if api_cat else categorize_question(question)
         rows.append({
             "venue": "polymarket",
             "market_id": str(m.get("id") or m.get("conditionId") or ""),
             "condition_id": m.get("conditionId"),
             "slug": m.get("slug"),
-            "question": m.get("question"),
-            "category": m.get("category"),
+            "question": question,
+            "category": category,
             "end_date": m.get("endDate"),
             "yes_token_id": yes_token,
             "no_token_id": no_token,
@@ -131,3 +137,79 @@ def normalize_polymarket_trades(payload: list[dict],
             "maker_address": t.get("makerAddress"),
         })
     return pd.DataFrame(rows)
+
+
+def normalize_kalshi_markets(payload: dict) -> pd.DataFrame:
+    """Flatten Kalshi /markets response. Prices already in USD (0.0-1.0)."""
+    from ..categorize import categorize_question
+    rows: list[dict] = []
+    markets = payload.get("markets", []) if isinstance(payload, dict) else []
+    for m in markets:
+        title = m.get("title") or m.get("yes_sub_title")
+        yes_bid = _f(m.get("yes_bid_dollars"))
+        yes_ask = _f(m.get("yes_ask_dollars"))
+        if yes_bid is not None and yes_ask is not None:
+            yes_price = (yes_bid + yes_ask) / 2
+        else:
+            yes_price = _f(m.get("last_price_dollars"))
+        no_price = (1.0 - yes_price) if yes_price is not None else None
+        spread = (yes_ask - yes_bid) if (yes_ask is not None and yes_bid is not None) else None
+
+        rows.append({
+            "venue": "kalshi",
+            "market_id": m.get("ticker"),
+            "condition_id": m.get("event_ticker"),
+            "slug": m.get("ticker"),
+            "question": title,
+            "category": categorize_question(title) if title else "other",
+            "end_date": m.get("close_time") or m.get("expiration_time"),
+            "yes_token_id": m.get("ticker"),
+            "no_token_id": None,
+            "yes_label": "Yes",
+            "no_label": "No",
+            "yes_price": yes_price,
+            "no_price": no_price,
+            "volume_24h": _f(m.get("volume_24h_fp")),
+            "volume_total": _f(m.get("volume_fp")),
+            "liquidity": _f(m.get("liquidity_dollars")),
+            "spread": spread,
+            "best_bid": yes_bid,
+            "best_ask": yes_ask,
+            "last_price": _f(m.get("last_price_dollars")),
+            "active": m.get("status") == "active",
+            "closed": m.get("status") not in ("active", "open"),
+        })
+    df = pd.DataFrame(rows)
+    obs.event(channel="persist", kind="kalshi.markets.normalized",
+              level="INFO", returned=len(df),
+              with_quotes=int(df["best_ask"].notna().sum()) if not df.empty else 0)
+    return df
+
+
+def normalize_kalshi_orderbook(payload: dict) -> dict:
+    """Convert Kalshi orderbook into Polymarket-style {bids, asks} on YES.
+
+    Kalshi returns yes_dollars (YES bids) and no_dollars (NO bids).
+    YES ask is inverted from NO bid: ask_yes_price = 1 - no_bid_price.
+    """
+    ob = (payload or {}).get("orderbook_fp", {}) or {}
+    yes_side = ob.get("yes_dollars") or []
+    no_side = ob.get("no_dollars") or []
+
+    bids: list[dict] = []
+    for lvl in yes_side:
+        try:
+            bids.append({"price": float(lvl[0]), "size": float(lvl[1])})
+        except (ValueError, TypeError, IndexError):
+            continue
+    bids.sort(key=lambda x: x["price"], reverse=True)
+
+    asks: list[dict] = []
+    for lvl in no_side:
+        try:
+            asks.append({"price": 1.0 - float(lvl[0]), "size": float(lvl[1])})
+        except (ValueError, TypeError, IndexError):
+            continue
+    asks.sort(key=lambda x: x["price"])
+
+    return {"bids": bids, "asks": asks}

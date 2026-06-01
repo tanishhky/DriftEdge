@@ -192,6 +192,7 @@ def open_position(market: dict, book: BookTop, rule: EntryRule,
         "venue": venue,
         "market_id": str(market.get("market_id", "")),
         "question": market.get("question", ""),
+        "category": market.get("category") or "other",
         "yes_token_id": market.get("yes_token_id"),
         "entry_ts": as_of_ts,
         "entry_snapshot_ts": book.snapshot_ts,
@@ -255,14 +256,14 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
     states = sp.init_state(data_dir, bankroll=bankroll)
 
     positions = pp.load_positions(data_dir)
-    # Key positions by (trader, market_id) so each trader has its own book.
+    # Key positions by (trader, venue, market_id) so each trader has its own
+    # book per venue (handles cross-venue same-event markets).
     open_by_key = {
-        (p.get("trader"), p.get("market_id")): p
+        (p.get("trader"), p.get("venue", "polymarket"), p.get("market_id")): p
         for p in positions if p.get("status") == "open"
     }
 
     opened, closed = [], []
-    books_dir = data_dir / "books" / "polymarket"
 
     per_trader_opened: dict[str, int] = {t: 0 for t in sizing.trader_labels()}
     per_trader_closed: dict[str, int] = {t: 0 for t in sizing.trader_labels()}
@@ -271,13 +272,15 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
         mid = str(m.get("market_id") or "")
         if not mid:
             continue
+        venue = m.get("venue") or "polymarket"
+        books_dir = data_dir / "books" / venue
         book = latest_book_top(books_dir, mid, as_of_ts=as_of_ts)
         if book is None:
             continue
 
         # ── EXIT side first (frees up capital before evaluating new opens) ──
         for trader_id in sizing.trader_labels():
-            existing = open_by_key.get((trader_id, mid))
+            existing = open_by_key.get((trader_id, venue, mid))
             if existing is None:
                 continue
             reason = should_close(book, existing, rule, as_of_ts,
@@ -286,27 +289,26 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
                 closed_pos = close_position(existing, book, reason, as_of_ts)
                 closed.append(closed_pos)
                 per_trader_closed[trader_id] += 1
-                # Update in-memory state so subsequent opens see freed capital.
                 size_usd = float(existing.get("entry_size_usd", 0.0))
                 pnl_usd = float(closed_pos.get("pnl_usd", 0.0))
                 states[trader_id] = sp.apply_close(states[trader_id],
                                                    size_usd, pnl_usd)
-                # Remove from open key so we don't try to close again.
-                del open_by_key[(trader_id, mid)]
+                del open_by_key[(trader_id, venue, mid)]
 
         # ── ENTRY side ──
         if not should_open(book, rule, as_of_ts=as_of_ts,
                            resolution_ts=m.get("end_date")):
             continue
         for trader_id, sizer_fn in sizing.SIZERS.items():
-            if (trader_id, mid) in open_by_key:
-                continue  # already in
+            if (trader_id, venue, mid) in open_by_key:
+                continue
             size_usd = sizer_fn(states[trader_id], c=book.best_ask,
                                 target=rule.target, stop=rule.stop)
             if size_usd <= 0:
                 continue
             new_pos = open_position(m, book, rule, as_of_ts,
-                                    trader=trader_id, size_usd=size_usd)
+                                    trader=trader_id, size_usd=size_usd,
+                                    venue=venue)
             opened.append(new_pos)
             per_trader_opened[trader_id] += 1
             states[trader_id] = sp.apply_open(states[trader_id], size_usd)
