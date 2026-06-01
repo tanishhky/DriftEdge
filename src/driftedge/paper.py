@@ -250,6 +250,7 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
 
     from .data import paper_persist as pp
     from .data import state_persist as sp
+    from .data import equity_persist as ep
     from . import sizing
 
     # Initialise per-trader state if first run; load otherwise.
@@ -262,6 +263,10 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
         (p.get("trader"), p.get("venue", "polymarket"), p.get("market_id")): p
         for p in positions if p.get("status") == "open"
     }
+
+    # book_mids feeds the MTM snapshot at the end of the tick. We populate
+    # it for every market we see a book for, whether or not we open/close.
+    book_mids: dict[tuple[str, str], float] = {}
 
     opened, closed = [], []
 
@@ -277,6 +282,8 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
         book = latest_book_top(books_dir, mid, as_of_ts=as_of_ts)
         if book is None:
             continue
+
+        book_mids[(venue, mid)] = book.mid
 
         # ── EXIT side first (frees up capital before evaluating new opens) ──
         for trader_id in sizing.trader_labels():
@@ -317,11 +324,28 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
         pp.upsert_positions(data_dir, opened=opened, closed=closed)
         sp.save_state(data_dir, states)
 
+    # ── Equity snapshot (every tick, regardless of opens/closes) ──
+    # Rebuild the open-positions list AFTER the entry/exit pass so the
+    # MTM reflects the position book we actually hold at as_of_ts.
+    open_positions_now = list(open_by_key.values()) + opened
+    peaks = ep.latest_peaks(data_dir)
+    snapshots = ep.build_snapshot(
+        ts=as_of_ts,
+        states=states,
+        open_positions=open_positions_now,
+        book_mids=book_mids,
+        peak_by_trader=peaks,
+    )
+    if snapshots:
+        ep.append_snapshot(data_dir, snapshots)
+
     obs.event(channel="fit", kind="paper.tick", level="INFO",
               as_of_ts=as_of_ts, markets_seen=len(markets),
               opened_by_trader=per_trader_opened,
-              closed_by_trader=per_trader_closed)
+              closed_by_trader=per_trader_closed,
+              equity_rows=len(snapshots))
 
     return {"as_of_ts": as_of_ts,
             "opened_by_trader": per_trader_opened,
-            "closed_by_trader": per_trader_closed}
+            "closed_by_trader": per_trader_closed,
+            "equity_snapshot_rows": len(snapshots)}
