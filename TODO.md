@@ -52,6 +52,60 @@ confirm this test exists and is in CI.
 - [ ] **fuzz test**: random sequence of past + future snapshots, replay,
       check that paper_trades.parquet is bit-identical to the past-only run.
 
+## Engine candidate: cross-side hedge (volatility-harvest)
+
+Not arbitrage, but a real positive-EV structure that the current
+`[0.30, 0.40] → 0.60` rule throws away. Worth building as a separate agent
+once the contract slice is in.
+
+**Idea (binary two-outcome market — sports, election head-to-head):**
+
+1. Buy the underdog YES at price `c_dog` (e.g. NYK at 0.21).
+2. Hold. If at any point during the market's life the favourite's YES ask
+   drops below `1 − c_dog − ε` (i.e., the underdog's price rises enough),
+   buy the favourite YES to hedge.
+3. Locked profit = `1 − c_dog − c_fav_at_hedge − fees`.
+4. If the hedge never fires, you end up with a directional bet at the
+   original underdog price; EV ≈ 0 if the market was efficient at entry.
+
+**Why this works:**
+- Prediction markets price the settlement probability; intra-game / intra-
+  market path variance is a free option you embed by buying early and
+  hedging late.
+- Equivalent to "selling realised variance" on the price path.
+
+**Why it can fail:**
+- Spread crossed twice (bid-ask × 2).
+- Slippage when the hedge-trigger price is brief or thin.
+- Capital lockup for hours / days.
+- Markets where path variance is low (long-dated political / macro
+  resolution) — `q` (hedge-fire probability) is too low to pay for the
+  capital + spread cost.
+
+**Pre-reqs before building:**
+
+- [ ] Contract slice landed (so this is a new agent under the
+      `predmarkets` department with its own budget, not a code fork of
+      `paper.py`).
+- [ ] Historical replay infrastructure: simulate the strategy over the
+      orderbook archive we already have for finished markets. Compute
+      realized `q` and avg locked profit per category.
+- [ ] Category filter: only enable on high-vol categories (sports first,
+      then short-dated political head-to-heads).
+
+**Tasks once pre-reqs are met:**
+
+- [ ] `agents/hedge_volharvest.py`: new agent class. Two-leg position
+      state (leg1_open, leg2_open). Entry rule: buy underdog when
+      `c_dog ∈ [entry_lo, entry_hi]`. Trigger rule: hedge when
+      `c_fav ≤ trigger`. Force-exit at resolution.
+- [ ] Replace the implicit `p_estimated` confusion: this agent does NOT
+      need an estimate of true `p` — the EV comes from path variance,
+      not from a probability edge. Document this in
+      `docs/decisions/0005-volharvest-strategy.md`.
+- [ ] Per-leg risk caps: max two open legs per market, max aggregate
+      exposure per market.
+
 ## Engine refinement (only after the above is in)
 
 The current rule (open at ask in `[0.30, 0.40]`, target 0.60, stop 0.20) is a
