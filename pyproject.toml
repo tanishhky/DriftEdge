@@ -21,6 +21,8 @@ dependencies = [
     "requests>=2.31",
     "websockets>=12",
     "rich>=13.7",
+    "vaderSentiment>=3.3.2",
+    "feedparser>=6.0",
 ]
 
 [project.optional-dependencies]

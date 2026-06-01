@@ -94,6 +94,8 @@ def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
     tracked_poly: list[dict[str, Any]] = []
     tracked_kalshi: list[dict[str, Any]] = []
     last_market_refresh = 0.0
+    last_news_sweep = 0.0
+    NEWS_INTERVAL_S = 900   # 15 minutes
     iteration = 0
 
     def _has_tradeable_window(end_date_str: Any, now_utc: datetime,
@@ -223,6 +225,16 @@ def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
                           level="WARNING", err=str(exc),
                           exc_type=type(exc).__name__)
 
+            # News sweep every NEWS_INTERVAL_S seconds.
+            if now - last_news_sweep >= NEWS_INTERVAL_S:
+                try:
+                    from .data import news as news_mod
+                    news_mod.fetch_all(c.data_dir)
+                    last_news_sweep = now
+                except Exception as exc:
+                    obs.event(channel="error", kind="news.sweep_fail",
+                              level="WARNING", err=str(exc))
+
             iteration += 1
             obs.event(channel="run", kind="poll.iteration_done",
                       level="DEBUG", iteration=iteration,
@@ -276,7 +288,18 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Run one paper-trading evaluation cycle (no-lookahead).")
     pt.set_defaults(func=cmd_paper_tick)
 
+    fn = sub.add_parser("fetch-news",
+                        help="One sweep of news adapters (RSS + GDELT + Reddit) with VADER sentiment.")
+    fn.set_defaults(func=cmd_fetch_news)
+
     return p
+
+
+def cmd_fetch_news(_: argparse.Namespace, c: cfg.Config) -> int:
+    from .data import news as news_mod
+    result = news_mod.fetch_all(c.data_dir)
+    obs.event(channel="run", kind="news.cli_done", level="INFO", **result)
+    return 0
 
 
 def cmd_paper_tick(_: argparse.Namespace, c: cfg.Config) -> int:
