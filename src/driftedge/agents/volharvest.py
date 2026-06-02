@@ -61,16 +61,25 @@ TRADER_ID = "volharvest"
 class VolHarvestRule:
     """All knobs for the volatility-harvest agent.
 
-    Defaults are conservative. Tighten `dog_high` to chase deeper underdogs;
-    raise `min_locked_profit` to demand a fatter cushion before hedging.
+    `exit_mode`:
+      'early_exit' (default, new) — when the dog leg is in profit by at least
+          `min_locked_profit`, SELL the dog at the YES bid. This realises the
+          same P&L as opening a hedge leg (binary-market parity:
+          yes_bid + no_ask = 1 ⇒ yes_bid - dog_entry = 1 - dog_entry - no_ask)
+          but doesn't tie up additional capital. Better in nearly every
+          scenario.
+      'hedge' (legacy) — when the synthetic NO ask drops far enough,
+          BUY the NO leg to lock in payoff at resolution. Originally
+          designed; preserved for A/B comparison.
     """
     dog_low: float = 0.10
     dog_high: float = 0.30
-    min_locked_profit: float = 0.05      # cents per share locked at hedge
+    min_locked_profit: float = 0.05      # cents per share locked at exit/hedge
     force_exit_hours_before_resolution: float = 6.0
     per_position_cap_pct: float = 0.02   # of bankroll for the DOG leg
     aggregate_cap_pct: float = 0.50      # of bankroll across all open exposure
     min_position_usd: float = 5.00
+    exit_mode: str = "early_exit"        # 'early_exit' | 'hedge'
 
 
 # ── Decision predicates ──────────────────────────────────────────────────
@@ -361,27 +370,42 @@ def tick(data_dir: Path, markets: list[dict],
             own_by_market.pop((venue, mid_id), None)
             held = {}
 
-        # ── HEDGE side (only if dog held alone) ──
+        # ── PROFIT-TAKE / HEDGE side (only if dog held alone) ──
         if held.get("dog") and not held.get("hedge"):
             dog_pos = held["dog"]
             dog_entry = float(dog_pos["entry_price"])
             no_price = hedge_trigger(book, dog_entry, rule)
             if no_price is not None:
-                shares = float(dog_pos["shares"])
-                ok, size_usd = _hedge_size_ok(shares, no_price,
-                                               bankroll_init, cash_usd,
-                                               open_exposure, rule)
-                if ok:
-                    hedge_pos = _open_hedge(
-                        m, book, as_of_ts, no_price=no_price,
-                        shares=shares, venue=venue,
-                        dog_trade_id=dog_pos["trade_id"],
-                    )
-                    opened.append(hedge_pos)
-                    cash_usd -= size_usd
-                    open_exposure += size_usd
-                    actions["open_hedge"] += 1
-                    own_by_market[(venue, mid_id)]["hedge"] = hedge_pos
+                if rule.exit_mode == "early_exit":
+                    # Capital-efficient path: sell the dog at the YES bid.
+                    # Realised P&L per share = yes_bid − dog_entry, which
+                    # equals 1 − dog_entry − no_ask by binary parity.
+                    closed_pos = _close_dog_only(dog_pos, book, as_of_ts,
+                                                  reason="early_exit")
+                    closed.append(closed_pos)
+                    cash_usd += float(dog_pos["entry_size_usd"]) + float(closed_pos["pnl_usd"])
+                    open_exposure -= float(dog_pos["entry_size_usd"])
+                    closed_pnl += float(closed_pos["pnl_usd"])
+                    actions["close_dogonly"] += 1
+                    own_by_market.pop((venue, mid_id), None)
+                    held = {}
+                else:
+                    # Legacy hedge path.
+                    shares = float(dog_pos["shares"])
+                    ok, size_usd = _hedge_size_ok(shares, no_price,
+                                                   bankroll_init, cash_usd,
+                                                   open_exposure, rule)
+                    if ok:
+                        hedge_pos = _open_hedge(
+                            m, book, as_of_ts, no_price=no_price,
+                            shares=shares, venue=venue,
+                            dog_trade_id=dog_pos["trade_id"],
+                        )
+                        opened.append(hedge_pos)
+                        cash_usd -= size_usd
+                        open_exposure += size_usd
+                        actions["open_hedge"] += 1
+                        own_by_market[(venue, mid_id)]["hedge"] = hedge_pos
 
         # ── ENTRY side (only if nothing held on this market) ──
         if not own_by_market.get((venue, mid_id)):

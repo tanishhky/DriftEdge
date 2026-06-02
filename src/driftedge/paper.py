@@ -252,6 +252,9 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
     from .data import state_persist as sp
     from .data import equity_persist as ep
     from . import sizing
+    from . import exit_rules as er
+
+    early_rule = er.EarlyExitRule()
 
     # Initialise per-trader state if first run; load otherwise.
     states = sp.init_state(data_dir, bankroll=bankroll)
@@ -285,13 +288,50 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
 
         book_mids[(venue, mid)] = book.mid
 
+        # ── Realized vol for this market (per hour) — drives the vol-aware
+        # early-exit predicate below. Computed once per market to keep the
+        # tick cheap. None ⇒ fall back to the rule's default.
+        market_vol_ph: Optional[float] = None
+        if any(open_by_key.get((tid, venue, mid)) is not None
+               for tid in sizing.trader_labels()):
+            market_vol_ph = er.realized_vol_per_hour(
+                books_dir, mid, as_of_ts=as_of_ts)
+        market_vol_ph = market_vol_ph if market_vol_ph is not None else early_rule.default_vol_per_hour
+
+        # Hours-to-resolution helper, shared between the standard close
+        # check and the early-exit check.
+        def _hours_left() -> Optional[float]:
+            res_ts = m.get("end_date")
+            if not res_ts:
+                return None
+            try:
+                t_now = datetime.fromisoformat(as_of_ts.replace("Z", "+00:00"))
+                t_res = datetime.fromisoformat(res_ts.replace("Z", "+00:00"))
+                return max(0.0, (t_res - t_now).total_seconds() / 3600.0)
+            except (ValueError, TypeError):
+                return None
+        hours_left_val = _hours_left()
+
         # ── EXIT side first (frees up capital before evaluating new opens) ──
         for trader_id in sizing.trader_labels():
             existing = open_by_key.get((trader_id, venue, mid))
             if existing is None:
                 continue
+            # Standard target / stop / time first.
             reason = should_close(book, existing, rule, as_of_ts,
                                   resolution_ts=m.get("end_date"))
+            # Vol-aware early exit only if the standard rule didn't already
+            # decide. This preserves backwards compat: if early-exit is
+            # disabled, behaviour is identical to before.
+            if reason is None:
+                reason = er.early_exit_reason(
+                    best_bid=book.best_bid,
+                    entry_price=float(existing.get("entry_price") or 0.0),
+                    target=rule.target,
+                    hours_left=hours_left_val,
+                    vol_per_hour=market_vol_ph,
+                    rule=early_rule,
+                )
             if reason:
                 closed_pos = close_position(existing, book, reason, as_of_ts)
                 closed.append(closed_pos)
