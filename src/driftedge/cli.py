@@ -225,6 +225,18 @@ def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
                           level="WARNING", err=str(exc),
                           exc_type=type(exc).__name__)
 
+            # Volharvest tick — runs after the standard paper tick so it
+            # sees the same world state. Its own entry/exit logic (binary
+            # underdog + opportunistic synthetic-NO hedge); independent
+            # state under trader_id='volharvest'.
+            try:
+                from .agents import volharvest
+                volharvest.tick(c.data_dir, all_markets)
+            except Exception as exc:
+                obs.event(channel="error", kind="volharvest.tick_fail",
+                          level="WARNING", err=str(exc),
+                          exc_type=type(exc).__name__)
+
             # News sweep every NEWS_INTERVAL_S seconds.
             if now - last_news_sweep >= NEWS_INTERVAL_S:
                 try:

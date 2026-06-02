@@ -134,5 +134,19 @@ SIZERS = {
 }
 
 
+# Traders whose entry/exit doesn't fit the global EntryRule and are run by
+# their own dedicated tick (see `driftedge.agents.*`). They still need state
+# (bankroll, cash, equity) — so they appear in `all_trader_labels()` and get
+# seeded by state_persist — but NOT in `SIZERS` / `trader_labels()`, which
+# drives the standard paper.tick loop.
+SELF_MANAGED_TRADERS: list[str] = ["volharvest"]
+
+
 def trader_labels() -> list[str]:
+    """Traders managed by the standard `paper.tick` loop."""
     return list(SIZERS.keys())
+
+
+def all_trader_labels() -> list[str]:
+    """Every trader the platform knows about, for state-init + dashboards."""
+    return list(SIZERS.keys()) + list(SELF_MANAGED_TRADERS)

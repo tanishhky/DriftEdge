@@ -10,7 +10,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .. import obs
-from ..sizing import TraderState, trader_labels
+from ..sizing import TraderState, all_trader_labels
 
 
 _STATE_FILE = "paper_state.parquet"
@@ -27,7 +27,7 @@ def init_state(data_dir: Path, bankroll: float = 10000.0) -> dict[str, TraderSta
         return load_state(data_dir)
 
     rows = []
-    for tid in trader_labels():
+    for tid in all_trader_labels():
         rows.append({
             "trader": tid,
             "bankroll_init": bankroll,

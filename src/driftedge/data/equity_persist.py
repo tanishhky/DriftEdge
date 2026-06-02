@@ -110,7 +110,12 @@ def build_snapshot(ts: str,
             shares = float(pos.get("shares") or 0.0)
             if mid is None or entry_price <= 0:
                 continue
-            mtm += (float(mid) - entry_price) * shares
+            # ── Side-aware MTM. YES legs MTM at the YES mid directly. NO
+            # legs (synthetic, used by volharvest's hedge) MTM at (1 - yes_mid)
+            # because buying NO is the inverse claim on the same underlying.
+            side = (pos.get("side") or "yes").lower()
+            current_price = (1.0 - float(mid)) if side == "no" else float(mid)
+            mtm += (current_price - entry_price) * shares
 
         cash = float(st.cash_usd)
         exposure = float(st.open_exposure)
