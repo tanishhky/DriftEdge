@@ -186,15 +186,39 @@ Every signal is logged to `logs/signals.jsonl` regardless of whether it fires. T
 
 ---
 
-## 5b. Paper-trading layer (minimal, shipped)
+## 5b. Paper-trading layer (multi-trader, shipped)
 
-A lookahead-safe paper-trading engine runs on every poll iteration. Lives in `src/driftedge/paper.py`, persists to `data/paper_trades.parquet`.
+A lookahead-safe paper-trading engine runs on every poll iteration. Lives in `src/driftedge/paper.py`, persists to `data/paper_trades.parquet` and `data/paper_equity_history.parquet`.
 
-**Decision rule (v0)** — for each tracked market on each tick:
+**Five active traders** (each seeded at $10k bankroll):
+
+| Trader | Managed by | Sizing strategy |
+|---|---|---|
+| `kelly` | `paper.tick` | Quarter-Kelly (κ=0.25, p_estimated=0.45) |
+| `equal` | `paper.tick` | Fixed 2% bankroll per trade |
+| `volwt` | `paper.tick` | Inverse-Bernoulli-stddev weight, capped 1.5× |
+| `volharvest` | `agents/volharvest.py` | Underdog YES + synthetic-NO hedge |
+| `resolution` | `agents/resolution.py` | Hold-to-binary; entry [0.25, 0.50]; ≤72h horizon |
+
+Standard traders (`kelly`, `equal`, `volwt`) run inside `paper.tick` on every poll iteration. Self-managed traders (`volharvest`, `resolution`) have their own tick function wired after `paper.tick` in `cli.py`. All five are seeded via `state_persist.init_state()` which auto-backfills missing traders on every call.
+
+**Resolution agent** — hold-to-binary strategy:
+- Entry: best_ask ∈ [0.25, 0.50], ≤72h to resolution
+- Sizing: scale = 1.0 + 0.5 × (1 − hours/72), capped at 1.5× — time-weighted toward expiry
+- Dynamic stop: exit when `best_bid − entry ≤ −0.15` and `hours_remaining ≤ 6`
+- Force-exit: 1h before resolution, no exceptions
+
+**Decision rule (standard traders)** — for each tracked market on each tick:
 - **Open** a paper-long Yes position when `entry_low ≤ best_ask ≤ entry_high` AND the market is not within `force_exit_hours_before_resolution`.
 - **Close** when `best_bid ≥ target` (take profit) OR `best_bid ≤ stop` (stop loss) OR `time_to_resolution < force_exit_hours_before_resolution` (force exit before event variance).
 
-Position size is fixed notional (`$100` default). Kelly sizing with `p_estimated` replaces this once the path engine (M2) is online.
+**Near-certain filter** — before tracking, both Polymarket and Kalshi markets where `best_ask ≤ 0.05` or `best_ask ≥ 0.95` are dropped (no entry opportunity, no meaningful MTM signal).
+
+**Equity history schema** (`data/paper_equity_history.parquet`):
+```
+trader, ts, total_equity_usd, cash_usd, open_exposure_usd,
+closed_pnl_usd, drawdown_pct, mtm_unrealized_usd
+```
 
 **Strict no-lookahead** — see ADR 0004:
 - All snapshot reads filter `snapshot_ts <= as_of_ts`.
