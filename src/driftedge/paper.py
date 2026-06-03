@@ -135,6 +135,12 @@ def should_open(book: BookTop, rule: EntryRule, *,
     """
     if not (rule.entry_low <= book.best_ask <= rule.entry_high):
         return False
+    # Don't enter if the current bid is already at or below the stop level.
+    # A wide bid-ask spread (e.g. ask=0.33, bid=0.16) would trigger the stop
+    # on the very next tick, wasting capital. This prevents the open→stop→
+    # re-open→stop loop that burns money on illiquid markets.
+    if book.best_bid <= rule.stop:
+        return False
     if as_of_ts and resolution_ts:
         try:
             t_now = datetime.fromisoformat(as_of_ts.replace("Z", "+00:00"))
@@ -368,11 +374,37 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
     # Rebuild the open-positions list AFTER the entry/exit pass so the
     # MTM reflects the position book we actually hold at as_of_ts.
     open_positions_now = list(open_by_key.values()) + opened
+
+    # Bug fix: ensure book_mids covers ALL open non-self-managed positions,
+    # not just the markets visited in this tick's tracked list. A position
+    # opened when market X was in top-N stays open even if X drifts out of
+    # the tracked set. Without this, MTM for those positions is always 0
+    # and the equity curve appears flat between opens/closes.
+    for pos in positions:
+        if pos.get("status") != "open":
+            continue
+        if (pos.get("trader") or "") in sizing.SELF_MANAGED_TRADERS:
+            continue
+        v = pos.get("venue", "polymarket")
+        mid_key = str(pos.get("market_id") or "")
+        if not mid_key or (v, mid_key) in book_mids:
+            continue
+        fallback = latest_book_top(data_dir / "books" / v, mid_key,
+                                   as_of_ts=as_of_ts)
+        if fallback is not None:
+            book_mids[(v, mid_key)] = fallback.mid
+
+    # Bug fix: volharvest manages its own equity snapshot in volharvest.tick().
+    # Exclude it here to avoid double rows with stale state values.
+    equity_states = {k: v for k, v in states.items()
+                     if k not in sizing.SELF_MANAGED_TRADERS}
+    equity_positions = [p for p in open_positions_now
+                        if (p.get("trader") or "") not in sizing.SELF_MANAGED_TRADERS]
     peaks = ep.latest_peaks(data_dir)
     snapshots = ep.build_snapshot(
         ts=as_of_ts,
-        states=states,
-        open_positions=open_positions_now,
+        states=equity_states,
+        open_positions=equity_positions,
         book_mids=book_mids,
         peak_by_trader=peaks,
     )

@@ -117,13 +117,20 @@ def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
 
                 # ── POLYMARKET refresh ──
                 try:
-                    payload = client.list_markets(limit=args.top_n * 4)
+                    payload = client.list_markets(limit=args.top_n * 6)
                     df = normalize.normalize_polymarket_markets(
                         payload, data_dir=c.data_dir)
                     persistence.write_markets_snapshot(df, c.data_dir,
                                                        venue="polymarket")
                     df = df.dropna(subset=["yes_token_id"])
                     df = df[(df["active"] == True) & (df["closed"] == False)]
+                    # Remove near-certain markets: ask ≤ 0.05 (market already
+                    # near-NO) or ask ≥ 0.95 (market already near-YES). These
+                    # occupy top-volume slots but have no entry opportunity and
+                    # no meaningful MTM signal.
+                    ask_col = df["best_ask"].fillna(0.5)
+                    before_price = len(df)
+                    df = df[(ask_col > 0.05) & (ask_col < 0.95)]
                     before = len(df)
                     df = df[df["end_date"].apply(
                         lambda s: _has_tradeable_window(s, now_utc, horizon_h))]
@@ -132,6 +139,7 @@ def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
                     obs.event(channel="run", kind="poll.tracked_refresh",
                               level="INFO", venue="polymarket",
                               tracked=len(tracked_poly),
+                              filtered_near_certain=before_price - before,
                               filtered_near_resolution=before - len(df))
                 except PolymarketError as exc:
                     obs.event(channel="error", kind="poll.markets_fail",
@@ -148,6 +156,9 @@ def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
                     kdf = kdf[kdf["active"] == True]
                     # Need a tradeable spread (best_ask present)
                     kdf = kdf.dropna(subset=["best_ask"])
+                    kask = kdf["best_ask"].fillna(0.5)
+                    before_kprice = len(kdf)
+                    kdf = kdf[(kask > 0.05) & (kask < 0.95)]
                     before_k = len(kdf)
                     kdf = kdf[kdf["end_date"].apply(
                         lambda s: _has_tradeable_window(s, now_utc, horizon_h))]
@@ -162,6 +173,7 @@ def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
                     obs.event(channel="run", kind="poll.tracked_refresh",
                               level="INFO", venue="kalshi",
                               tracked=len(tracked_kalshi),
+                              filtered_near_certain=before_kprice - before_k,
                               filtered_near_resolution=before_k - len(kdf),
                               sort_col=sort_col)
                 except KalshiError as exc:
@@ -234,6 +246,17 @@ def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
                 volharvest.tick(c.data_dir, all_markets)
             except Exception as exc:
                 obs.event(channel="error", kind="volharvest.tick_fail",
+                          level="WARNING", err=str(exc),
+                          exc_type=type(exc).__name__)
+
+            # Resolution tick — hold-to-binary agent. Enters [0.25, 0.50]
+            # markets resolving ≤72h away; holds until resolution or
+            # dynamic stop; force-exits 1h before resolution.
+            try:
+                from .agents import resolution as resolution_agent
+                resolution_agent.tick(c.data_dir, all_markets)
+            except Exception as exc:
+                obs.event(channel="error", kind="resolution.tick_fail",
                           level="WARNING", err=str(exc),
                           exc_type=type(exc).__name__)
 

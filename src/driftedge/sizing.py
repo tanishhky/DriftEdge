@@ -139,7 +139,7 @@ SIZERS = {
 # (bankroll, cash, equity) — so they appear in `all_trader_labels()` and get
 # seeded by state_persist — but NOT in `SIZERS` / `trader_labels()`, which
 # drives the standard paper.tick loop.
-SELF_MANAGED_TRADERS: list[str] = ["volharvest"]
+SELF_MANAGED_TRADERS: list[str] = ["volharvest", "resolution"]
 
 
 def trader_labels() -> list[str]:

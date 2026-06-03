@@ -21,14 +21,41 @@ def _path(data_dir: Path) -> Path:
 
 
 def init_state(data_dir: Path, bankroll: float = 10000.0) -> dict[str, TraderState]:
-    """Idempotent: create initial state file if missing, else load existing."""
+    """Idempotent: create initial state file if missing, else load existing.
+
+    If the file exists but is missing rows for newly-added traders (e.g. a
+    new SELF_MANAGED_TRADERS entry), those rows are appended automatically so
+    the state file stays in sync with the codebase without a manual reset.
+    """
     p = _path(data_dir)
-    if p.exists():
+    if not p.exists():
+        rows = []
+        for tid in all_trader_labels():
+            rows.append({
+                "trader": tid,
+                "bankroll_init": bankroll,
+                "cash_usd": bankroll,
+                "open_exposure": 0.0,
+                "closed_pnl": 0.0,
+                "peak_equity": bankroll,
+                "current_drawdown_pct": 0.0,
+                "updated_ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            })
+        df = pd.DataFrame(rows)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.Table.from_pandas(df, preserve_index=False),
+                       p, compression="snappy")
+        obs.event(channel="persist", kind="paper.state.init", level="INFO",
+                  traders=len(rows), bankroll=bankroll)
         return load_state(data_dir)
 
-    rows = []
-    for tid in all_trader_labels():
-        rows.append({
+    # File exists — add any traders absent from the on-disk state.
+    existing = load_state(data_dir)
+    missing = [tid for tid in all_trader_labels() if tid not in existing]
+    if missing:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        df_old = pd.read_parquet(p)
+        new_rows = pd.DataFrame([{
             "trader": tid,
             "bankroll_init": bankroll,
             "cash_usd": bankroll,
@@ -36,15 +63,16 @@ def init_state(data_dir: Path, bankroll: float = 10000.0) -> dict[str, TraderSta
             "closed_pnl": 0.0,
             "peak_equity": bankroll,
             "current_drawdown_pct": 0.0,
-            "updated_ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        })
-    df = pd.DataFrame(rows)
-    data_dir.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.Table.from_pandas(df, preserve_index=False),
-                   p, compression="snappy")
-    obs.event(channel="persist", kind="paper.state.init", level="INFO",
-              traders=len(rows), bankroll=bankroll)
-    return load_state(data_dir)
+            "updated_ts": now,
+        } for tid in missing])
+        df_merged = pd.concat([df_old, new_rows], ignore_index=True)
+        pq.write_table(pa.Table.from_pandas(df_merged, preserve_index=False),
+                       p, compression="snappy")
+        obs.event(channel="persist", kind="paper.state.backfill", level="INFO",
+                  added=missing, bankroll=bankroll)
+        return load_state(data_dir)
+
+    return existing
 
 
 def load_state(data_dir: Path) -> dict[str, TraderState]:

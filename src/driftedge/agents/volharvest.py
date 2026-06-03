@@ -440,6 +440,20 @@ def tick(data_dir: Path, markets: list[dict],
 
     # Equity snapshot — append a row for THIS trader only, MTM included.
     own_open_now = [p for slot in own_by_market.values() for p in slot.values()]
+
+    # Ensure book_mids covers ALL own open positions, including those on
+    # markets that drifted out of the current tracked list. Without this,
+    # positions on older markets show MTM=0 and the equity curve stays flat.
+    for pos in own_open:
+        v = pos.get("venue", "polymarket")
+        mid_key = str(pos.get("market_id") or "")
+        if not mid_key or (v, mid_key) in book_mids:
+            continue
+        fallback = latest_book_top(data_dir / "books" / v, mid_key,
+                                   as_of_ts=as_of_ts)
+        if fallback is not None:
+            book_mids[(v, mid_key)] = fallback.mid
+
     peaks = ep.latest_peaks(data_dir)
     snaps = ep.build_snapshot(
         ts=as_of_ts,
