@@ -58,3 +58,6 @@ Thumbs.db
 # ── Jupyter ────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
 *.ipynb_checkpoints
+
+# machine-specific launchd config (absolute paths) — keep local only
+scripts/launchd/*.plist

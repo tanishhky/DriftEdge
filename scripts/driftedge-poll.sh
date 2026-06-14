@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-PROJECT="/Users/tanishkyadav/dev/DriftEdge"
+PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${PROJECT}/.venv/bin/python"
 
 cd "$PROJECT"
