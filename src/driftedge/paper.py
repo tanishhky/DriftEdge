@@ -41,6 +41,39 @@ import pandas as pd
 from . import obs
 
 
+# ── Robust ISO 8601 parsing (shared with agents) ─────────────────────────
+
+def hours_until(target_iso: Optional[str], as_of_iso: str) -> Optional[float]:
+    """Hours from as_of_iso until target_iso. Returns None when either
+    side is missing or unparseable. Negative when target is in the past.
+
+    Hoisted out of paper.tick's per-iteration scope so it isn't redefined
+    on every market (Bug 12 fix, 2026-06-05).
+    """
+    if not target_iso:
+        return None
+    try:
+        return (parse_iso(str(target_iso)) - parse_iso(as_of_iso)).total_seconds() / 3600.0
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_iso(ts: str) -> datetime:
+    """Parse an ISO 8601 string to a tz-aware UTC datetime.
+
+    Accepts both "+00:00" and "Z" suffixes, with or without sub-second
+    precision. All return values are normalised to UTC. Use this anywhere
+    we compare timestamps from different sources (book writer vs market
+    end_date vs as_of_ts) — string lexicographic comparison breaks under
+    mixed suffix conventions ("Z" > "+" in ASCII).
+    """
+    s = str(ts).replace("Z", "+00:00")
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 # ── Domain types ─────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -64,7 +97,18 @@ class BookTop:
 
     @property
     def mid(self) -> float:
-        return (self.best_bid + self.best_ask) / 2.0
+        # Robust to one-sided books: fall back to the side that exists when the
+        # other is NaN (so ask-only Kalshi snapshots don't poison sizing).
+        import math
+        bid_ok = not math.isnan(self.best_bid)
+        ask_ok = not math.isnan(self.best_ask)
+        if bid_ok and ask_ok:
+            return (self.best_bid + self.best_ask) / 2.0
+        if ask_ok:
+            return self.best_ask
+        if bid_ok:
+            return self.best_bid
+        return float("nan")
 
 
 # ── Lookahead-protected snapshot reader ──────────────────────────────────
@@ -75,12 +119,16 @@ def latest_book_top(books_dir: Path, market_id: str,
     snapshot_ts <= as_of_ts. Returns None if no eligible snapshot.
 
     The `as_of_ts` filter is THE no-lookahead guarantee for this function.
+    Comparisons use parsed datetimes, not string lexicographic order, to
+    survive mixed-suffix data (Z vs +00:00 vs naive vs microsecond).
     """
     market_dir = books_dir / market_id
     if not market_dir.exists():
         return None
 
+    as_of_dt = parse_iso(as_of_ts)
     best: Optional[BookTop] = None
+    best_dt: Optional[datetime] = None
     for parquet in market_dir.glob("*.parquet"):
         try:
             df = pd.read_parquet(parquet)
@@ -90,34 +138,48 @@ def latest_book_top(books_dir: Path, market_id: str,
             continue
         if df.empty or "snapshot_ts" not in df.columns:
             continue
-        # ── critical: filter out any snapshot newer than as_of_ts ──
-        df = df[df["snapshot_ts"] <= as_of_ts]
+        # Parse once, compare numerically. pandas.to_datetime handles both
+        # Z and +00:00 suffixes; utc=True normalises naïve values.
+        try:
+            ts_dt = pd.to_datetime(df["snapshot_ts"], utc=True, format="mixed")
+        except (TypeError, ValueError):
+            # Older pandas: format="mixed" unsupported. Fall back to default
+            # parsing — accepts both suffix conventions, just slower.
+            ts_dt = pd.to_datetime(df["snapshot_ts"], utc=True)
+        df = df.assign(_ts_dt=ts_dt)
+        df = df[df["_ts_dt"] <= as_of_dt]
         if df.empty:
             continue
-        latest_ts = df["snapshot_ts"].max()
-        snap = df[df["snapshot_ts"] == latest_ts]
+        latest_dt = df["_ts_dt"].max()
+        snap = df[df["_ts_dt"] == latest_dt]
 
         bids = snap[snap["side"] == "bid"].sort_values("price", ascending=False)
         asks = snap[snap["side"] == "ask"].sort_values("price", ascending=True)
         if bids.empty or asks.empty:
             continue
 
+        # Preserve original string form of the snapshot timestamp.
+        latest_ts_str = str(snap["snapshot_ts"].iloc[0])
         top = BookTop(
-            snapshot_ts=str(latest_ts),
+            snapshot_ts=latest_ts_str,
             best_bid=float(bids.iloc[0]["price"]),
             best_ask=float(asks.iloc[0]["price"]),
             bid_depth=float(bids["size"].sum()),
             ask_depth=float(asks["size"].sum()),
         )
-        # We may have multiple parquets per market across days; pick newest.
-        if best is None or top.snapshot_ts > best.snapshot_ts:
+        # Pick newest across files via parsed datetime, not string compare.
+        latest_dt_py = latest_dt.to_pydatetime() if hasattr(latest_dt, "to_pydatetime") else latest_dt
+        if best is None or (best_dt is not None and latest_dt_py > best_dt):
             best = top
+            best_dt = latest_dt_py
 
-    # Assertion: the chosen snapshot cannot be in the future.
+    # Assertion: the chosen snapshot cannot be in the future. Parse to
+    # datetime so mixed-suffix timestamps don't false-positive.
     if best is not None:
-        assert best.snapshot_ts <= as_of_ts, (
-            f"LOOKAHEAD VIOLATION: chose snapshot {best.snapshot_ts} > "
-            f"as_of_ts {as_of_ts} for market {market_id}"
+        chosen_dt = parse_iso(best.snapshot_ts)
+        assert chosen_dt <= as_of_dt, (
+            f"LOOKAHEAD VIOLATION: chose snapshot {chosen_dt.isoformat()} > "
+            f"as_of_ts {as_of_dt.isoformat()} for market {market_id}"
         )
     return best
 
@@ -161,8 +223,32 @@ def should_close(book: BookTop, position: dict,
     Reasons:
       'target' — best_bid reached target (we can SELL to take profit)
       'stop'   — best_ask fell to stop (we'd realize at best_bid)
-      'time'   — within force_exit_hours of resolution
+      'time'   — within force_exit_hours of resolution AND book is fresh
+
+    Stale-bid guard (top-level, 2026-06-05): when hours_left <= 0
+    (resolution has happened) AND the book we have was captured before
+    the resolution time, NONE of the bid-based exit decisions can be
+    trusted — the bid is a pre-settlement quote that doesn't reflect the
+    actual outcome. We defer the close until a fresh, post-resolution
+    book arrives. This must run BEFORE target/stop checks because a
+    stale bid can spuriously cross either threshold.
     """
+    # ── Stale-bid guard ──
+    if resolution_ts:
+        try:
+            t_now = parse_iso(as_of_ts)
+            t_res = parse_iso(resolution_ts)
+            t_book = parse_iso(book.snapshot_ts)
+            if (t_res - t_now).total_seconds() <= 0 and t_book < t_res:
+                obs.event(channel="fit", kind="paper.stale_book_skip_close",
+                          level="DEBUG", as_of_ts=as_of_ts,
+                          market_id=position.get("market_id"),
+                          book_snapshot_ts=book.snapshot_ts,
+                          resolution_ts=resolution_ts)
+                return None
+        except (ValueError, TypeError):
+            pass
+
     # Take-profit check: we'd SELL at the bid.
     if book.best_bid >= rule.target:
         return "target"
@@ -174,8 +260,8 @@ def should_close(book: BookTop, position: dict,
     # Time-based force exit.
     if resolution_ts:
         try:
-            t_now = datetime.fromisoformat(as_of_ts.replace("Z", "+00:00"))
-            t_res = datetime.fromisoformat(resolution_ts.replace("Z", "+00:00"))
+            t_now = parse_iso(as_of_ts)
+            t_res = parse_iso(resolution_ts)
             hours_left = (t_res - t_now).total_seconds() / 3600.0
             if hours_left < rule.force_exit_hours_before_resolution:
                 return "time"
@@ -191,7 +277,9 @@ def open_position(market: dict, book: BookTop, rule: EntryRule,
                   as_of_ts: str, *, trader: str, size_usd: float,
                   venue: str = "polymarket") -> dict:
     """Construct a new position dict. Pure — no side effects."""
-    assert book.snapshot_ts <= as_of_ts, "lookahead in open_position"
+    assert parse_iso(book.snapshot_ts) <= parse_iso(as_of_ts), (
+        f"lookahead in open_position: snapshot={book.snapshot_ts} "
+        f"as_of_ts={as_of_ts}")
     return {
         "trade_id": str(uuid.uuid4()),
         "trader": trader,
@@ -205,6 +293,10 @@ def open_position(market: dict, book: BookTop, rule: EntryRule,
         "entry_price": book.best_ask,
         "entry_size_usd": size_usd,
         "shares": size_usd / book.best_ask if book.best_ask > 0 else 0.0,
+        # Resolution timestamp stored so the orphan-exit loop in tick()
+        # can force-close even after the market drops out of the daemon's
+        # tracked snapshot. New 2026-06-05.
+        "resolution_ts": market.get("end_date"),
         "target": rule.target,
         "stop": rule.stop,
         "status": "open",
@@ -220,7 +312,9 @@ def open_position(market: dict, book: BookTop, rule: EntryRule,
 def close_position(position: dict, book: BookTop, reason: str,
                    as_of_ts: str) -> dict:
     """Realize P&L. Pure — returns a new dict with exit fields populated."""
-    assert book.snapshot_ts <= as_of_ts, "lookahead in close_position"
+    assert parse_iso(book.snapshot_ts) <= parse_iso(as_of_ts), (
+        f"lookahead in close_position: snapshot={book.snapshot_ts} "
+        f"as_of_ts={as_of_ts}")
     closed = dict(position)
     exit_price = book.best_bid  # we SELL at the bid (conservative)
     pnl_per_share = exit_price - position["entry_price"]
@@ -273,6 +367,42 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
         for p in positions if p.get("status") == "open"
     }
 
+    # ── Synthetic-stub prepend for orphan positions ──
+    # If any of kelly/equal/volwt holds a position on a market that's no
+    # longer in the daemon's tracked `markets` snapshot, the original loop
+    # would never visit it and its exit logic would never fire. Build a
+    # minimal stub so the existing loop covers the orphan. The cli.py
+    # upstream augmentation also adds these, but this is a per-agent
+    # safety net for the case where the upstream lookup fails (e.g., the
+    # market is not in any prior daily parquet).
+    tracked_keys = {
+        (m.get("venue") or "polymarket", str(m.get("market_id") or ""))
+        for m in markets
+    }
+    own_open_by_market: dict[tuple[str, str], dict] = {}
+    for p in positions:
+        if p.get("status") != "open":
+            continue
+        if (p.get("trader") or "") in sizing.SELF_MANAGED_TRADERS:
+            continue
+        v = p.get("venue") or "polymarket"
+        mid = str(p.get("market_id") or "")
+        if mid:
+            own_open_by_market[(v, mid)] = p
+    orphan_stubs: list[dict] = []
+    for key, pos in own_open_by_market.items():
+        if key in tracked_keys:
+            continue
+        venue, mid_id = key
+        orphan_stubs.append({
+            "venue": venue,
+            "market_id": mid_id,
+            "end_date": pos.get("resolution_ts"),
+            "category": pos.get("category") or "other",
+            "question": pos.get("question") or "",
+            "_orphan": True,
+        })
+
     # book_mids feeds the MTM snapshot at the end of the tick. We populate
     # it for every market we see a book for, whether or not we open/close.
     book_mids: dict[tuple[str, str], float] = {}
@@ -282,7 +412,7 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
     per_trader_opened: dict[str, int] = {t: 0 for t in sizing.trader_labels()}
     per_trader_closed: dict[str, int] = {t: 0 for t in sizing.trader_labels()}
 
-    for m in markets:
+    for m in list(markets) + orphan_stubs:
         mid = str(m.get("market_id") or "")
         if not mid:
             continue
@@ -304,19 +434,11 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
                 books_dir, mid, as_of_ts=as_of_ts)
         market_vol_ph = market_vol_ph if market_vol_ph is not None else early_rule.default_vol_per_hour
 
-        # Hours-to-resolution helper, shared between the standard close
-        # check and the early-exit check.
-        def _hours_left() -> Optional[float]:
-            res_ts = m.get("end_date")
-            if not res_ts:
-                return None
-            try:
-                t_now = datetime.fromisoformat(as_of_ts.replace("Z", "+00:00"))
-                t_res = datetime.fromisoformat(res_ts.replace("Z", "+00:00"))
-                return max(0.0, (t_res - t_now).total_seconds() / 3600.0)
-            except (ValueError, TypeError):
-                return None
-        hours_left_val = _hours_left()
+        # Hours-to-resolution shared between standard close + early-exit.
+        # Clamp at 0 to preserve the prior closure semantics (negative
+        # hours weren't returned).
+        _raw_hl = hours_until(m.get("end_date"), as_of_ts)
+        hours_left_val = max(0.0, _raw_hl) if _raw_hl is not None else None
 
         # ── EXIT side first (frees up capital before evaluating new opens) ──
         for trader_id in sizing.trader_labels():
@@ -349,6 +471,11 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
                 del open_by_key[(trader_id, venue, mid)]
 
         # ── ENTRY side ──
+        # Never re-enter on an orphan stub: its book is whatever the daemon
+        # last fetched (possibly stale by days), so opening on it would
+        # commit capital at a price the daemon can't refresh.
+        if m.get("_orphan"):
+            continue
         if not should_open(book, rule, as_of_ts=as_of_ts,
                            resolution_ts=m.get("end_date")):
             continue
@@ -413,11 +540,13 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
 
     obs.event(channel="fit", kind="paper.tick", level="INFO",
               as_of_ts=as_of_ts, markets_seen=len(markets),
+              orphans_visited=len(orphan_stubs),
               opened_by_trader=per_trader_opened,
               closed_by_trader=per_trader_closed,
               equity_rows=len(snapshots))
 
     return {"as_of_ts": as_of_ts,
+            "orphans_visited": len(orphan_stubs),
             "opened_by_trader": per_trader_opened,
             "closed_by_trader": per_trader_closed,
             "equity_snapshot_rows": len(snapshots)}

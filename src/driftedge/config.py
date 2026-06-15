@@ -37,6 +37,18 @@ class Config:
     kalshi_api_key_id: Optional[str]
     kalshi_private_key_path: Optional[Path]
 
+    # Kuber — the 6th agent (real-money capable).
+    # Defaults: paper mode with $500 split 4 ways across kelly/equal/volwt/
+    # volharvest sleeves. Flip kuber_live=True (env KUBER_LIVE=1) to route
+    # entries through KalshiClient.place_order instead of simulated fills.
+    kuber_live: bool
+    kuber_bankroll_total_usd: float
+    kuber_bankroll_per_sleeve_usd: float
+    kuber_max_position_usd: float
+    kuber_dd_kill_pct: float
+    kuber_daily_loss_kill_usd: float
+    kuber_allow_one_sided: bool = False
+
 
 def load() -> Config:
     return Config(
@@ -62,4 +74,15 @@ def load() -> Config:
             Path(os.getenv("KALSHI_PRIVATE_KEY_PATH")).resolve()
             if os.getenv("KALSHI_PRIVATE_KEY_PATH") else None
         ),
+
+        kuber_live=os.getenv("KUBER_LIVE", "0").lower() in ("1", "true", "yes"),
+        kuber_bankroll_total_usd=float(os.getenv("KUBER_BANKROLL", "500")),
+        kuber_bankroll_per_sleeve_usd=float(
+            os.getenv("KUBER_BANKROLL_PER_SLEEVE", "125")),
+        kuber_max_position_usd=float(os.getenv("KUBER_MAX_POSITION_USD", "5")),
+        kuber_dd_kill_pct=float(os.getenv("KUBER_DD_KILL_PCT", "0.40")),
+        kuber_daily_loss_kill_usd=float(
+            os.getenv("KUBER_DAILY_LOSS_KILL_USD", "25")),
+        kuber_allow_one_sided=os.getenv(
+            "KUBER_ALLOW_ONE_SIDED", "0").lower() in ("1", "true", "yes"),
     )
