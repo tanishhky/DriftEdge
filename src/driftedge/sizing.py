@@ -64,10 +64,20 @@ class TraderState:
 # Each returns the USD size to commit (0 to skip).
 
 def _apply_caps(size_usd: float, state: TraderState) -> float:
-    """Apply per-position and aggregate caps, then min-size floor."""
+    """Apply per-position cap, aggregate-exposure cap, cash floor, then
+    min-size floor.
+
+    The cash floor (added 2026-06-05) prevents opening positions that
+    would push cash negative when the trader has accumulated large
+    realized losses but exposure-cap headroom remains. Without it,
+    `available_for_new = agg_cap − open_exposure` could exceed cash, the
+    sizer returns a positive number, and `apply_open` subtracts more than
+    cash holds.
+    """
     per_position_cap = state.bankroll_init * MAX_SINGLE_EXPOSURE
     size_usd = min(size_usd, per_position_cap)
     size_usd = min(size_usd, state.available_for_new)
+    size_usd = min(size_usd, max(0.0, state.cash_usd))
     return size_usd if size_usd >= MIN_POSITION_USD else 0.0
 
 

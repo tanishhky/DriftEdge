@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from .. import obs
-from ..paper import latest_book_top, BookTop
+from ..paper import latest_book_top, BookTop, parse_iso
 
 
 TRADER_ID = "resolution"
@@ -57,11 +57,21 @@ def _hours_to(resolution_ts: Optional[str], as_of_ts: str) -> Optional[float]:
     if not resolution_ts:
         return None
     try:
-        t_now = datetime.fromisoformat(as_of_ts.replace("Z", "+00:00"))
-        t_res = datetime.fromisoformat(str(resolution_ts).replace("Z", "+00:00"))
-        return (t_res - t_now).total_seconds() / 3600.0
+        return (parse_iso(str(resolution_ts)) - parse_iso(as_of_ts)).total_seconds() / 3600.0
     except (ValueError, TypeError):
         return None
+
+
+def _book_pre_resolution(book: BookTop, resolution_ts: Optional[str]) -> bool:
+    """True if the book we have was captured strictly BEFORE resolution.
+    Indicates the bid is a pre-settlement quote — not a safe exit price
+    for force-close in the post-resolution window."""
+    if not resolution_ts:
+        return False
+    try:
+        return parse_iso(book.snapshot_ts) < parse_iso(str(resolution_ts))
+    except (ValueError, TypeError):
+        return False
 
 
 # ── Decision predicates ───────────────────────────────────────────────────
@@ -84,26 +94,44 @@ def should_open(book: BookTop, rule: ResolutionRule, *,
 def should_dynamic_stop(book: BookTop, entry_price: float,
                         rule: ResolutionRule, *,
                         as_of_ts: str, resolution_ts: Optional[str]) -> bool:
-    """True if we're near resolution AND the bid has fallen enough below entry."""
+    """True if we're near resolution AND the bid has fallen enough below entry.
+
+    Stale-bid guard (2026-06-05): post-resolution with a pre-resolution
+    book → defer (would trigger a stop on a stale, pre-settlement quote).
+    """
     hours = _hours_to(resolution_ts, as_of_ts)
     if hours is None or hours > rule.near_resolution_h:
+        return False
+    if hours <= 0 and _book_pre_resolution(book, resolution_ts):
         return False
     return (book.best_bid - entry_price) <= -rule.loss_threshold
 
 
 def should_force_close(rule: ResolutionRule, *,
-                       as_of_ts: str, resolution_ts: Optional[str]) -> bool:
+                       as_of_ts: str, resolution_ts: Optional[str],
+                       book: Optional[BookTop] = None) -> bool:
+    """Time-based force exit. If book is supplied AND we're past resolution
+    AND the book is pre-resolution, defer (the bid would be a stale,
+    pre-settlement quote and the recorded exit would underprice the actual
+    payoff)."""
     hours = _hours_to(resolution_ts, as_of_ts)
     if hours is None:
         return False
-    return hours < rule.force_exit_h
+    if hours >= rule.force_exit_h:
+        return False
+    # Stale-bid guard for post-resolution closes.
+    if hours <= 0 and book is not None and _book_pre_resolution(book, resolution_ts):
+        return False
+    return True
 
 
 # ── Position constructors (pure) ──────────────────────────────────────────
 
 def _open_position(market: dict, book: BookTop, as_of_ts: str, *,
                    size_usd: float, venue: str) -> dict:
-    assert book.snapshot_ts <= as_of_ts, "lookahead in resolution._open_position"
+    assert parse_iso(book.snapshot_ts) <= parse_iso(as_of_ts), (
+        f"lookahead in resolution._open_position: snapshot={book.snapshot_ts} "
+        f"as_of_ts={as_of_ts}")
     return {
         "trade_id": str(uuid.uuid4()),
         "trader": TRADER_ID,
@@ -120,6 +148,7 @@ def _open_position(market: dict, book: BookTop, as_of_ts: str, *,
         "entry_price": book.best_ask,
         "entry_size_usd": size_usd,
         "shares": size_usd / book.best_ask if book.best_ask > 0 else 0.0,
+        "resolution_ts": market.get("end_date"),
         "target": None,
         "stop": None,
         "status": "open",
@@ -133,7 +162,9 @@ def _open_position(market: dict, book: BookTop, as_of_ts: str, *,
 
 
 def _close_position(pos: dict, book: BookTop, as_of_ts: str, reason: str) -> dict:
-    assert book.snapshot_ts <= as_of_ts, "lookahead in resolution._close_position"
+    assert parse_iso(book.snapshot_ts) <= parse_iso(as_of_ts), (
+        f"lookahead in resolution._close_position: snapshot={book.snapshot_ts} "
+        f"as_of_ts={as_of_ts}")
     closed = dict(pos)
     exit_price = book.best_bid
     pnl_per_share = exit_price - pos["entry_price"]
@@ -200,9 +231,34 @@ def tick(data_dir: Path, markets: list[dict],
     own_open = [p for p in positions
                 if p.get("trader") == TRADER_ID and p.get("status") == "open"]
 
-    own_by_market: dict[str, dict] = {
-        str(p.get("market_id", "")): p for p in own_open
+    # Key by (venue, market_id) so colliding market_ids across venues are
+    # separate entries. (Bug fix 2026-06-05.)
+    own_by_market: dict[tuple[str, str], dict] = {
+        (p.get("venue") or "polymarket", str(p.get("market_id", ""))): p
+        for p in own_open
     }
+
+    # ── Synthetic-stub prepend for orphan positions ──
+    # If a held resolution position's market isn't in `markets`, the loop
+    # wouldn't visit it and force-close would never fire. Prepend a stub
+    # using the position's stored resolution_ts.
+    tracked_keys = {
+        (m.get("venue") or "polymarket", str(m.get("market_id") or ""))
+        for m in markets
+    }
+    orphan_stubs: list[dict] = []
+    for key, pos in own_by_market.items():
+        if key in tracked_keys:
+            continue
+        venue, mid_id = key
+        orphan_stubs.append({
+            "venue": venue,
+            "market_id": mid_id,
+            "end_date": pos.get("resolution_ts"),
+            "category": pos.get("category") or "other",
+            "question": pos.get("question") or "",
+            "_orphan": True,
+        })
 
     opened: list[dict] = []
     closed: list[dict] = []
@@ -210,7 +266,7 @@ def tick(data_dir: Path, markets: list[dict],
     actions: dict[str, int] = {"open": 0, "close_force": 0,
                                 "close_stop": 0, "skipped_horizon": 0}
 
-    for m in markets:
+    for m in list(markets) + orphan_stubs:
         mid_id = str(m.get("market_id") or "")
         if not mid_id:
             continue
@@ -221,19 +277,20 @@ def tick(data_dir: Path, markets: list[dict],
             continue
         book_mids[(venue, mid_id)] = book.mid
 
-        held = own_by_market.get(mid_id)
+        held = own_by_market.get((venue, mid_id))
         resolution_ts = m.get("end_date")
 
-        # ── EXIT: force close ──
+        # ── EXIT: force close (with stale-bid guard for post-resolution) ──
         if held and should_force_close(rule, as_of_ts=as_of_ts,
-                                        resolution_ts=resolution_ts):
+                                        resolution_ts=resolution_ts,
+                                        book=book):
             closed_pos = _close_position(held, book, as_of_ts, "time")
             closed.append(closed_pos)
             cash_usd += float(held["entry_size_usd"]) + float(closed_pos["pnl_usd"])
             open_exposure -= float(held["entry_size_usd"])
             closed_pnl += float(closed_pos["pnl_usd"])
             actions["close_force"] += 1
-            own_by_market.pop(mid_id, None)
+            own_by_market.pop((venue, mid_id), None)
             held = None
 
         # ── EXIT: dynamic stop (near resolution + large loss) ──
@@ -246,11 +303,15 @@ def tick(data_dir: Path, markets: list[dict],
             open_exposure -= float(held["entry_size_usd"])
             closed_pnl += float(closed_pos["pnl_usd"])
             actions["close_stop"] += 1
-            own_by_market.pop(mid_id, None)
+            own_by_market.pop((venue, mid_id), None)
             held = None
 
         # ── ENTRY: open if nothing held on this market ──
-        if not own_by_market.get(mid_id):
+        # Never re-enter on an orphan stub (its book is whatever the daemon
+        # last fetched, possibly stale by days).
+        if m.get("_orphan"):
+            continue
+        if not own_by_market.get((venue, mid_id)):
             ok, hours = should_open(book, rule, as_of_ts=as_of_ts,
                                     resolution_ts=resolution_ts)
             if not ok:
@@ -265,7 +326,7 @@ def tick(data_dir: Path, markets: list[dict],
                     cash_usd -= size_usd
                     open_exposure += size_usd
                     actions["open"] += 1
-                    own_by_market[mid_id] = pos
+                    own_by_market[(venue, mid_id)] = pos
 
     if opened or closed:
         pp.upsert_positions(data_dir, opened=opened, closed=closed)
@@ -307,6 +368,8 @@ def tick(data_dir: Path, markets: list[dict],
 
     obs.event(channel="fit", kind="resolution.tick", level="INFO",
               as_of_ts=as_of_ts, markets_seen=len(markets),
+              orphans_visited=len(orphan_stubs),
               **actions, equity_rows=len(snaps))
 
-    return {"as_of_ts": as_of_ts, **actions}
+    return {"as_of_ts": as_of_ts,
+            "orphans_visited": len(orphan_stubs), **actions}

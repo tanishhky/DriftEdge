@@ -9,6 +9,7 @@ API reference: docs.kalshi.com/api-reference
 from __future__ import annotations
 
 import base64
+import json
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -107,6 +108,65 @@ class KalshiClient:
                 obs.bump("api_errors")
                 raise KalshiError(f"non-JSON response on {path}") from exc
 
+    def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        """RSA-signed POST. Always authed — order placement needs it."""
+        if self._private_key is None or self._key_id is None:
+            raise KalshiError(
+                "POST requires Kalshi credentials: set KALSHI_API_KEY_ID "
+                "and KALSHI_PRIVATE_KEY_PATH.")
+        url = f"{self._base}{path}"
+        headers = self._sign("POST", path)
+        headers["Content-Type"] = "application/json"
+
+        with obs.timed("api", "kalshi.post", endpoint=path) as t:
+            try:
+                resp = self._session.post(url, data=json.dumps(body),
+                                            headers=headers,
+                                            timeout=self._timeout)
+            except requests.RequestException as exc:
+                obs.bump("api_errors")
+                raise KalshiError(f"network error on POST {path}: {exc}") from exc
+
+            t.add(status=resp.status_code, bytes=len(resp.content))
+            obs.bump("api_calls")
+
+            if resp.status_code >= 400:
+                obs.bump("api_errors")
+                raise KalshiError(
+                    f"HTTP {resp.status_code} on POST {path}: {resp.text[:400]}")
+            try:
+                return resp.json()
+            except ValueError as exc:
+                obs.bump("api_errors")
+                raise KalshiError(f"non-JSON response on POST {path}") from exc
+
+    def _delete(self, path: str) -> dict[str, Any]:
+        """RSA-signed DELETE — used for cancelling resting orders."""
+        if self._private_key is None or self._key_id is None:
+            raise KalshiError("DELETE requires Kalshi credentials.")
+        url = f"{self._base}{path}"
+        headers = self._sign("DELETE", path)
+
+        with obs.timed("api", "kalshi.delete", endpoint=path) as t:
+            try:
+                resp = self._session.delete(url, headers=headers,
+                                              timeout=self._timeout)
+            except requests.RequestException as exc:
+                obs.bump("api_errors")
+                raise KalshiError(f"network error on DELETE {path}: {exc}") from exc
+
+            t.add(status=resp.status_code, bytes=len(resp.content))
+            obs.bump("api_calls")
+
+            if resp.status_code >= 400:
+                obs.bump("api_errors")
+                raise KalshiError(
+                    f"HTTP {resp.status_code} on DELETE {path}: {resp.text[:400]}")
+            try:
+                return resp.json() if resp.content else {}
+            except ValueError:
+                return {}
+
     # ---------- public read endpoints (no auth required) ----------
 
     def list_markets(self, *, status: Optional[str] = None,
@@ -152,3 +212,84 @@ class KalshiClient:
         params: dict[str, Any] = {"limit": limit}
         if cursor: params["cursor"] = cursor
         return self._get("/series", params=params)
+
+    # ---------- authed portfolio + trading endpoints ----------
+
+    def get_balance(self) -> dict[str, Any]:
+        """Return cents-denominated cash balance and total exposure."""
+        return self._get("/portfolio/balance", auth=True)
+
+    def get_positions(self, *, ticker: Optional[str] = None,
+                      limit: int = 200,
+                      cursor: Optional[str] = None) -> dict[str, Any]:
+        """List currently-held positions across markets."""
+        params: dict[str, Any] = {"limit": limit}
+        if ticker: params["ticker"] = ticker
+        if cursor: params["cursor"] = cursor
+        return self._get("/portfolio/positions", params=params, auth=True)
+
+    def get_orders(self, *, ticker: Optional[str] = None,
+                   status: Optional[str] = None,
+                   limit: int = 200,
+                   cursor: Optional[str] = None) -> dict[str, Any]:
+        """List orders. status ∈ {resting, canceled, executed}."""
+        params: dict[str, Any] = {"limit": limit}
+        if ticker: params["ticker"] = ticker
+        if status: params["status"] = status
+        if cursor: params["cursor"] = cursor
+        return self._get("/portfolio/orders", params=params, auth=True)
+
+    def get_fills(self, *, ticker: Optional[str] = None,
+                  limit: int = 200,
+                  cursor: Optional[str] = None) -> dict[str, Any]:
+        """List recent fills — used for reconciliation."""
+        params: dict[str, Any] = {"limit": limit}
+        if ticker: params["ticker"] = ticker
+        if cursor: params["cursor"] = cursor
+        return self._get("/portfolio/fills", params=params, auth=True)
+
+    def place_order(self, *, market_ticker: str, side: str,
+                    action: str = "buy", order_type: str = "limit",
+                    count: int, price_cents: int,
+                    client_order_id: Optional[str] = None,
+                    expiration_ts: Optional[int] = None,
+                    post_only: bool = True) -> dict[str, Any]:
+        """Place a limit order on Kalshi.
+
+        side : "yes" or "no" (Kalshi binary outcomes)
+        action : "buy" or "sell"
+        count : number of contracts
+        price_cents : limit price in cents (1-99)
+        post_only : reject if the order would cross (passive only)
+
+        Returns the API's order dict including `order_id`.
+        """
+        assert side in ("yes", "no"), f"bad side: {side}"
+        assert action in ("buy", "sell"), f"bad action: {action}"
+        assert 1 <= int(price_cents) <= 99, (
+            f"price_cents must be 1-99, got {price_cents}")
+        assert int(count) >= 1, f"count must be >=1, got {count}"
+
+        body: dict[str, Any] = {
+            "ticker": market_ticker,
+            "side": side,
+            "action": action,
+            "type": order_type,
+            "count": int(count),
+        }
+        # Kalshi uses yes_price / no_price as the limit price (cents).
+        if side == "yes":
+            body["yes_price"] = int(price_cents)
+        else:
+            body["no_price"] = int(price_cents)
+        if client_order_id:
+            body["client_order_id"] = client_order_id
+        if expiration_ts:
+            body["expiration_ts"] = int(expiration_ts)
+        if post_only:
+            body["post_only"] = True
+        return self._post("/portfolio/orders", body=body)
+
+    def cancel_order(self, order_id: str) -> dict[str, Any]:
+        """Cancel a resting order by its API-assigned id."""
+        return self._delete(f"/portfolio/orders/{order_id}")

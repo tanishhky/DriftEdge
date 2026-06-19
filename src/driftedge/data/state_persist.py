@@ -93,15 +93,29 @@ def load_state(data_dir: Path) -> dict[str, TraderState]:
 
 
 def save_state(data_dir: Path, states: dict[str, TraderState]) -> None:
+    """Save per-trader cost-basis state. peak_equity is sourced from the
+    MTM-based equity_history.latest_peaks so this file's peak matches the
+    one Sentinel's equity-curve panel uses (Bug 4 fix, 2026-06-05).
+
+    Note that peak_equity here is one tick behind equity_history because
+    save_state runs BEFORE the current tick's equity row is appended. The
+    one-tick lag is acceptable for dashboards; the previous cost-basis
+    peak silently diverged from the MTM peak and led to mismatched
+    drawdown numbers in different parts of the UI.
+    """
+    from . import equity_persist as ep
+
     p = _path(data_dir)
     existing = pd.read_parquet(p) if p.exists() else pd.DataFrame()
     existing_idx = {r["trader"]: r for _, r in existing.iterrows()} if not existing.empty else {}
 
+    mtm_peaks = ep.latest_peaks(data_dir)
+
     rows = []
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     for tid, s in states.items():
-        prev = existing_idx.get(tid, {})
-        peak = max(float(prev.get("peak_equity", s.bankroll_init)), s.total_equity)
+        prev_peak = float(existing_idx.get(tid, {}).get("peak_equity", s.bankroll_init))
+        peak = float(mtm_peaks.get(tid, prev_peak))
         dd_pct = ((peak - s.total_equity) / peak * 100.0) if peak > 0 else 0.0
         rows.append({
             "trader": tid,

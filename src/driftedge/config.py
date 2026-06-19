@@ -47,6 +47,11 @@ class Config:
     kuber_max_position_usd: float
     kuber_dd_kill_pct: float
     kuber_daily_loss_kill_usd: float
+    # Resolution agent is QUARANTINED by default (2026-06-18): it buys YES on
+    # any market with ask in [0.25,0.50] resolving <=72h with NO edge signal
+    # (price != probability), sized large -> realized -$4.2k. Set
+    # DRIFTEDGE_RESOLUTION_ENABLED=1 only after a real p_estimate edge is added.
+    resolution_enabled: bool = False
     kuber_allow_one_sided: bool = False
 
 
@@ -85,4 +90,6 @@ def load() -> Config:
             os.getenv("KUBER_DAILY_LOSS_KILL_USD", "25")),
         kuber_allow_one_sided=os.getenv(
             "KUBER_ALLOW_ONE_SIDED", "0").lower() in ("1", "true", "yes"),
+        resolution_enabled=os.getenv(
+            "DRIFTEDGE_RESOLUTION_ENABLED", "0").lower() in ("1", "true", "yes"),
     )

@@ -51,7 +51,7 @@ from typing import Optional
 import pandas as pd
 
 from .. import obs
-from ..paper import latest_book_top, BookTop
+from ..paper import latest_book_top, BookTop, parse_iso
 
 
 TRADER_ID = "volharvest"
@@ -104,13 +104,30 @@ def should_open_dog(book: BookTop, rule: VolHarvestRule, *,
 
 
 def hedge_trigger(book: BookTop, dog_entry: float,
-                  rule: VolHarvestRule) -> Optional[float]:
-    """Return synthetic NO ask if the hedge trigger fires, else None.
+                  rule: VolHarvestRule, *,
+                  as_of_ts: Optional[str] = None,
+                  resolution_ts: Optional[str] = None) -> Optional[float]:
+    """Return synthetic NO ask if the hedge / early-exit trigger fires.
 
     Synthetic NO ask = 1 - yes_bid (price you'd pay to buy NO via selling
-    YES at the bid). The hedge fires only if the locked profit per share
+    YES at the bid). The trigger fires only if the locked profit per share
     after both legs >= rule.min_locked_profit.
+
+    Stale-bid guard (2026-06-05): when as_of_ts and resolution_ts are
+    provided AND we're past resolution AND the book is from before
+    resolution, the bid is a stale pre-settlement quote — don't trigger.
     """
+    # Stale-bid guard.
+    if as_of_ts and resolution_ts:
+        try:
+            t_now = parse_iso(as_of_ts)
+            t_res = parse_iso(resolution_ts)
+            t_book = parse_iso(book.snapshot_ts)
+            if (t_res - t_now).total_seconds() <= 0 and t_book < t_res:
+                return None
+        except (ValueError, TypeError):
+            pass
+
     no_ask_synth = 1.0 - book.best_bid
     if no_ask_synth <= 0 or no_ask_synth >= 1:
         return None
@@ -123,14 +140,25 @@ def hedge_trigger(book: BookTop, dog_entry: float,
 def should_force_close(book: BookTop, rule: VolHarvestRule, *,
                        as_of_ts: str,
                        resolution_ts: Optional[str]) -> bool:
-    """Time-based force exit, identical semantics to paper.should_close."""
+    """Time-based force exit, with stale-bid guard.
+
+    Past-resolution closes with a pre-resolution book would record the
+    exit at a stale, pre-settlement bid — missing the actual payoff. We
+    defer until a fresh book arrives. New 2026-06-05.
+    """
     if not resolution_ts:
         return False
     try:
-        t_now = datetime.fromisoformat(as_of_ts.replace("Z", "+00:00"))
-        t_res = datetime.fromisoformat(resolution_ts.replace("Z", "+00:00"))
+        t_now = parse_iso(as_of_ts)
+        t_res = parse_iso(resolution_ts)
+        t_book = parse_iso(book.snapshot_ts)
         hours_left = (t_res - t_now).total_seconds() / 3600.0
-        return hours_left < rule.force_exit_hours_before_resolution
+        if hours_left >= rule.force_exit_hours_before_resolution:
+            return False
+        # Stale-bid guard for post-resolution closes.
+        if hours_left <= 0 and t_book < t_res:
+            return False
+        return True
     except (ValueError, TypeError):
         return False
 
@@ -139,7 +167,9 @@ def should_force_close(book: BookTop, rule: VolHarvestRule, *,
 
 def _open_dog(market: dict, book: BookTop, as_of_ts: str, *,
               size_usd: float, venue: str) -> dict:
-    assert book.snapshot_ts <= as_of_ts, "lookahead in volharvest._open_dog"
+    assert parse_iso(book.snapshot_ts) <= parse_iso(as_of_ts), (
+        f"lookahead in volharvest._open_dog: snapshot={book.snapshot_ts} "
+        f"as_of_ts={as_of_ts}")
     return {
         "trade_id": str(uuid.uuid4()),
         "trader": TRADER_ID,
@@ -156,6 +186,9 @@ def _open_dog(market: dict, book: BookTop, as_of_ts: str, *,
         "entry_price": book.best_ask,
         "entry_size_usd": size_usd,
         "shares": size_usd / book.best_ask if book.best_ask > 0 else 0.0,
+        # ── Stored at entry so the orphan-exit loop can force-close even
+        # after the market drops out of the daemon's tracked snapshot.
+        "resolution_ts": market.get("end_date"),
         # target/stop/exit_reason are not used by volharvest; carried for
         # schema compatibility with paper_trades.parquet.
         "target": None,
@@ -173,7 +206,9 @@ def _open_dog(market: dict, book: BookTop, as_of_ts: str, *,
 def _open_hedge(market: dict, book: BookTop, as_of_ts: str, *,
                 no_price: float, shares: float, venue: str,
                 dog_trade_id: str) -> dict:
-    assert book.snapshot_ts <= as_of_ts, "lookahead in volharvest._open_hedge"
+    assert parse_iso(book.snapshot_ts) <= parse_iso(as_of_ts), (
+        f"lookahead in volharvest._open_hedge: snapshot={book.snapshot_ts} "
+        f"as_of_ts={as_of_ts}")
     size_usd = shares * no_price
     return {
         "trade_id": str(uuid.uuid4()),
@@ -192,6 +227,7 @@ def _open_hedge(market: dict, book: BookTop, as_of_ts: str, *,
         "entry_price": no_price,      # synthetic NO ask (1 - yes_bid)
         "entry_size_usd": size_usd,
         "shares": shares,
+        "resolution_ts": market.get("end_date"),
         "target": None,
         "stop": None,
         "status": "open",
@@ -207,7 +243,9 @@ def _open_hedge(market: dict, book: BookTop, as_of_ts: str, *,
 def _close_dog_only(pos: dict, book: BookTop, as_of_ts: str,
                     reason: str) -> dict:
     """Close a dog-only leg at the YES bid (sell). Pure."""
-    assert book.snapshot_ts <= as_of_ts, "lookahead in volharvest._close_dog_only"
+    assert parse_iso(book.snapshot_ts) <= parse_iso(as_of_ts), (
+        f"lookahead in volharvest._close_dog_only: snapshot={book.snapshot_ts} "
+        f"as_of_ts={as_of_ts}")
     closed = dict(pos)
     exit_price = book.best_bid
     pnl_per_share = exit_price - pos["entry_price"]
@@ -230,7 +268,9 @@ def _close_hedge(pos: dict, book: BookTop, as_of_ts: str,
 
     no_bid_synthetic = 1 - yes_ask (sell NO by buying YES at the ask).
     """
-    assert book.snapshot_ts <= as_of_ts, "lookahead in volharvest._close_hedge"
+    assert parse_iso(book.snapshot_ts) <= parse_iso(as_of_ts), (
+        f"lookahead in volharvest._close_hedge: snapshot={book.snapshot_ts} "
+        f"as_of_ts={as_of_ts}")
     closed = dict(pos)
     no_bid_synth = max(0.0, 1.0 - book.best_ask)
     pnl_per_share = no_bid_synth - pos["entry_price"]
@@ -321,13 +361,40 @@ def tick(data_dir: Path, markets: list[dict],
         leg = p.get("leg") or "dog"
         own_by_market.setdefault(key, {})[leg] = p
 
+    # ── Synthetic-stub prepend for orphan positions ──
+    # If we hold a position on a market that's no longer in the daemon's
+    # tracked `markets` snapshot, the original loop would never visit it
+    # and its exit logic (force-close near resolution, early-exit on bid
+    # drift) would never fire. Synthesize a minimal stub so the existing
+    # loop covers the orphan.
+    tracked_keys = {
+        (m.get("venue") or "polymarket", str(m.get("market_id") or ""))
+        for m in markets
+    }
+    orphan_stubs: list[dict] = []
+    for key, legs in own_by_market.items():
+        if key in tracked_keys:
+            continue
+        venue, mid_id = key
+        # Pull the position's stored resolution_ts and category from any
+        # leg (dog or hedge — both carry the same).
+        any_leg = next(iter(legs.values()))
+        orphan_stubs.append({
+            "venue": venue,
+            "market_id": mid_id,
+            "end_date": any_leg.get("resolution_ts"),
+            "category": any_leg.get("category") or "other",
+            "question": any_leg.get("question") or "",
+            "_orphan": True,
+        })
+
     opened: list[dict] = []
     closed: list[dict] = []
     book_mids: dict[tuple[str, str], float] = {}
     actions: dict[str, int] = {"open_dog": 0, "open_hedge": 0,
                                 "close_resolution": 0, "close_dogonly": 0}
 
-    for m in markets:
+    for m in list(markets) + orphan_stubs:
         mid_id = str(m.get("market_id") or "")
         if not mid_id:
             continue
@@ -374,7 +441,9 @@ def tick(data_dir: Path, markets: list[dict],
         if held.get("dog") and not held.get("hedge"):
             dog_pos = held["dog"]
             dog_entry = float(dog_pos["entry_price"])
-            no_price = hedge_trigger(book, dog_entry, rule)
+            no_price = hedge_trigger(book, dog_entry, rule,
+                                       as_of_ts=as_of_ts,
+                                       resolution_ts=resolution_ts)
             if no_price is not None:
                 if rule.exit_mode == "early_exit":
                     # Capital-efficient path: sell the dog at the YES bid.
@@ -408,7 +477,10 @@ def tick(data_dir: Path, markets: list[dict],
                         own_by_market[(venue, mid_id)]["hedge"] = hedge_pos
 
         # ── ENTRY side (only if nothing held on this market) ──
-        if not own_by_market.get((venue, mid_id)):
+        # Never re-enter on an orphan stub: its book is whatever the daemon
+        # last fetched (possibly stale by days), so opening on it would
+        # commit capital at a price the daemon can't refresh.
+        if not own_by_market.get((venue, mid_id)) and not m.get("_orphan"):
             if should_open_dog(book, rule, as_of_ts=as_of_ts,
                                 resolution_ts=resolution_ts):
                 size_usd = _dog_size(bankroll_init, cash_usd, open_exposure,
@@ -467,6 +539,8 @@ def tick(data_dir: Path, markets: list[dict],
 
     obs.event(channel="fit", kind="volharvest.tick", level="INFO",
               as_of_ts=as_of_ts, markets_seen=len(markets),
+              orphans_visited=len(orphan_stubs),
               **actions, equity_rows=len(snaps))
 
-    return {"as_of_ts": as_of_ts, **actions}
+    return {"as_of_ts": as_of_ts, "orphans_visited": len(orphan_stubs),
+            **actions}
