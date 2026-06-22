@@ -7,7 +7,7 @@ Kuber is a *meta-agent* with four sleeves sharing one $500 wallet:
     kuber:kelly        $125  (Kelly sizing on edge)
     kuber:equal        $125  (equal-weight)
     kuber:volwt        $125  (inverse-vol weighted)
-    kuber:volharvest   $125  (vol-harvest strategy)
+    kuber:halfkelly    $125  (half-Kelly - conservative directional)
 
 Each sleeve runs the same decision logic as its paper-trading namesake
 (see ``sizing.py`` and ``agents.volharvest``) but writes to a separate
@@ -64,7 +64,7 @@ SLEEVE_LABELS: list[str] = [
     "kuber:kelly",
     "kuber:equal",
     "kuber:volwt",
-    "kuber:volharvest",
+    "kuber:halfkelly",
 ]
 
 # Floor — Kalshi imposes a 1-contract minimum, and below $5 commission
@@ -119,7 +119,7 @@ def _raw_size(sleeve_kind: str, *, bankroll: float, c: float,
     per-sleeve scale they produce $2.50 sizes which fall below the
     base's own $5 floor — a contradiction.
     """
-    if sleeve_kind == "kelly":
+    if sleeve_kind in ("kelly", "halfkelly"):
         if c <= 0 or c >= 1 or stop >= c or target <= c:
             return 0.0
         a = (target - c) / c
@@ -131,7 +131,11 @@ def _raw_size(sleeve_kind: str, *, bankroll: float, c: float,
         f_star = (p * a - q * b) / (a * b)
         if f_star <= 0:
             return 0.0
-        return bankroll * base_sizing.KELLY_KAPPA * f_star
+        # halfkelly: conservative directional sleeve at half the Kelly stake.
+        # Distinct from kelly/equal/volwt and — being directional — the
+        # standard target/stop it inherits from the tick loop is appropriate.
+        kappa = base_sizing.KELLY_KAPPA * (0.5 if sleeve_kind == "halfkelly" else 1.0)
+        return bankroll * kappa * f_star
 
     if sleeve_kind == "equal":
         # Equal weight: 4% of bankroll (Kuber's per-position fraction).
@@ -145,14 +149,6 @@ def _raw_size(sleeve_kind: str, *, bankroll: float, c: float,
             return 0.0
         scale = min(1.5, 0.5 / sigma)
         return bankroll * KUBER_FRACTION_OF_SLEEVE * scale
-
-    if sleeve_kind == "volharvest":
-        # Volharvest's own decision module passes its raw recommendation
-        # in directly; this branch is a fallback when the wrapper sleeve
-        # is invoked through the standard tick loop. Equal-weight is the
-        # safest default until volharvest-as-a-Kuber-sleeve is fully
-        # wired (uses its own should_open/should_close upstream).
-        return bankroll * KUBER_FRACTION_OF_SLEEVE
 
     return 0.0
 
