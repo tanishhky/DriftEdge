@@ -14,11 +14,16 @@ That's a 24-cent move on a 36-cent ticket (+67% return) without taking event var
 
 ## Status
 
-**M1-M5 shipped (2026-05-30 to 2026-05-31):** Polymarket ingestion, normalized Parquet persistence, continuous polling daemon, paper-trading engine with strict no-lookahead enforcement (ADR 0004), and a **3-trader sizing horse race** (Kelly + Equal-Wt + Vol-Wt) each running with $10,000 paper bankrolls. Kalshi adapter built but not yet wired into polling (M6).
+**Shipped:** Polymarket **and Kalshi** ingestion, normalized Parquet persistence, continuous polling daemon, and a paper-trading engine with strict no-lookahead enforcement (ADR 0004). The race is now **five paper traders** on $10,000 bankrolls — Kelly, Equal-Wt, Vol-Wt, **VolHarvest** (an underdog-YES + synthetic-NO hedge agent), and **Resolution** — plus **Kuber**, a sixth, Kalshi-only, real-money-capable meta-agent (four sleeves; cut into its own repo at [Kuber](https://github.com/tanishhky/Kuber)).
+
+> **Status notes (2026-06):**
+> - **Resolution is quarantined** (default off, `DRIFTEDGE_RESOLUTION_ENABLED=0`). An audit found it had no edge: it bought YES on any market with ask in `[0.25, 0.50]` near resolution with no probability estimate (price != probability) and bled. Re-enable only with a real `p_estimate`.
+> - **Daemon stability fixed.** A `liquidity`-sort KeyError could brick the poll loop into a do-nothing spin, and resolved-market orderbooks were re-requested forever (a 404 storm that dragged cadence). Both fixed; a one-sided-book guard and per-tick visibility were added.
+> - The embedded Kuber 4th sleeve was renamed `volharvest` -> `halfkelly` (it never ran the hedge logic). Paper ledgers were reset after these fixes, so equity curves start fresh.
 
 **Known v0 limitation:** entry/target/stop thresholds (`[0.30, 0.40]` entry, `0.60` target, `0.20` stop) are currently **hardcoded**, not computed from market statistics. The proper version (per-market confidence intervals from observed price history) is on the roadmap. See ADR 0003 for the price-vs-probability discipline that keeps this swap clean.
 
-**Operationally:** the project lives at `~/dev/DriftEdge/`. A `KeepAlive` launchd job polls Polymarket continuously (markets every 5 min, top-20 orderbooks every 30 s) and runs paper decisions on every tick.
+**Operationally:** the project lives at `~/Documents/SecondBrain/GitHub/DriftEdge/`. A `KeepAlive` launchd job polls Polymarket continuously (markets every 5 min, top-20 orderbooks every 30 s) and runs paper decisions on every tick.
 
 ## What's wired up today
 
@@ -26,12 +31,13 @@ That's a 24-cent move on a 36-cent ticket (+67% return) without taking event var
 |---|---|
 | `driftedge ping` / `fetch-markets` / `fetch-orderbook` / `paper-tick` / `poll` | shipped |
 | Polymarket adapter (Gamma + CLOB read endpoints, no auth required) | shipped |
-| Kalshi adapter (REST v2 read methods + RSA-PSS signing scaffold) | shipped, **not yet integrated into polling** |
+| Kalshi adapter (REST v2 read methods + RSA-PSS signing) | shipped, **wired into polling** |
 | Normalization layer (uniform DataFrame schema across venues) | shipped |
 | Parquet persistence (markets snapshots, orderbook snapshots, trades) | shipped |
-| Continuous polling daemon (launchd KeepAlive) | shipped |
+| Continuous polling daemon (launchd KeepAlive; spin-brick + 404-storm fixed) | shipped |
 | Paper-trading engine, lookahead-safe by construction | shipped |
-| 3-trader sizing engine (Kelly + Equal + Vol-Wt) | shipped |
+| 5-trader race (Kelly + Equal + Vol-Wt + VolHarvest + Resolution) | shipped (Resolution quarantined) |
+| Kuber meta-agent (6th, Kalshi-only, real-money-capable) | shipped (own repo) |
 | Per-trader portfolio state (bankroll, cash, exposure, drawdown, peak equity) | shipped |
 | Near-resolution-market filter in polling loop | shipped |
 | Skip-on-resolution-window in `should_open` | shipped |
@@ -40,17 +46,19 @@ That's a 24-cent move on a 36-cent ticket (+67% return) without taking event var
 | Computed entry/target/stop from market history | planned |
 | Cross-venue arbitrage (Polymarket ↔ Kalshi) | planned (M6) |
 
-## The 3-trader paper-trading horse race
+## The paper-trading horse race
 
-Three independent sizers each operate on the same entry/exit triggers but with different position-sizing logic. Each gets $10,000 starting paper bankroll. The winner is whichever finishes the highest equity with reasonable drawdown.
+Independent agents operate on the same world state but with different sizing or strategy logic. Each gets a $10,000 paper bankroll. The three core sizers below share the same entry/exit triggers; VolHarvest and Resolution run their own logic.
 
-| Trader | Sizing rule |
+| Trader | Rule |
 |---|---|
 | **Kelly** | Quarter-Kelly with conservative `p_estimated = 0.45`. Smaller positions on smaller edges; built so swapping `p_estimated` for path-engine output is a one-line change. |
 | **Equal-Wt** | Fixed 2 % of bankroll per position (max single exposure cap). The "naive diversifier" baseline. |
 | **Vol-Wt** | Inverse-Bernoulli-stddev weighted. Slight tilt toward extreme prices vs. mid-band. Risk-parity for binary contracts. |
+| **VolHarvest** | Underdog-YES leg + an opportunistic synthetic-NO hedge; harvests intra-market path variance. Carries no directional stop. |
+| **Resolution** | Hold-to-binary near resolution. **Quarantined (default off)** — no edge in audit; re-enable only with a real probability estimate. |
 
-Shared caps applied to all three: 2 % per position, 50 % aggregate exposure, $5 min trade.
+Shared caps on the three sizers: 2 % per position, 50 % aggregate exposure, $5 min trade. A sixth agent, **Kuber** (Kalshi-only, real-money-capable, four sleeves), lives in its own repo.
 
 ## No-lookahead enforcement (ADR 0004)
 
@@ -59,7 +67,7 @@ Every function that reads historical data takes an explicit `as_of_ts` parameter
 ## Install / install autorun
 
 ```
-cd ~/dev/DriftEdge
+cd ~/Documents/SecondBrain/GitHub/DriftEdge
 python3 -m venv .venv
 .venv/bin/pip install -e .
 ./scripts/launchd/install.sh    # starts continuous poll daemon
