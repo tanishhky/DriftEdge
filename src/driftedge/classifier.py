@@ -21,6 +21,7 @@ weather, other. The 'other' category requires manual review by default.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -195,22 +196,57 @@ def _cache_path(data_dir: Path) -> Path:
     return data_dir / _CACHE_FILE
 
 
+_EMPTY_CACHE_COLS = [
+    "venue", "market_id", "category", "confidence", "matched_rule",
+    "decided", "reviewer", "classifier_version",
+    "first_seen", "decided_at", "question",
+]
+
+
+def _ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Guarantee every expected column exists, so callers can safely do
+    cache["market_id"] etc. A cache read that came back missing a column (empty
+    or partial-schema parquet) used to raise KeyError('market_id') straight into
+    the poll loop; adding the absent columns as empty prevents that."""
+    for col in _EMPTY_CACHE_COLS:
+        if col not in df.columns:
+            df[col] = pd.Series(dtype="object")
+    return df
+
+
 def _load_cache(data_dir: Path) -> pd.DataFrame:
     p = _cache_path(data_dir)
     if not p.exists():
-        return pd.DataFrame(columns=[
-            "venue", "market_id", "category", "confidence", "matched_rule",
-            "decided", "reviewer", "classifier_version",
-            "first_seen", "decided_at", "question",
-        ])
-    return pd.read_parquet(p)
+        return pd.DataFrame(columns=_EMPTY_CACHE_COLS)
+    try:
+        return _ensure_schema(pd.read_parquet(p))
+    except Exception as exc:  # noqa: BLE001 - corrupt/truncated cache must self-heal
+        # A corrupt cache (e.g. a write interrupted by a restart) used to throw
+        # here and brick the entire market-refresh loop, starving the daemon of
+        # tradeable markets. Quarantine the bad file and rebuild from empty:
+        # the cache is a derived lookup, so losing it costs only re-classification.
+        try:
+            bad = p.with_suffix(".corrupt")
+            p.replace(bad)
+            obs.event(channel="error", kind="classifier.cache_corrupt",
+                      level="WARNING", path=str(p), quarantined=str(bad), err=str(exc))
+        except Exception:  # noqa: BLE001
+            obs.event(channel="error", kind="classifier.cache_corrupt_unlink_fail",
+                      level="WARNING", path=str(p), err=str(exc))
+        return pd.DataFrame(columns=_EMPTY_CACHE_COLS)
 
 
 def _save_cache(data_dir: Path, df: pd.DataFrame) -> None:
     p = _cache_path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
+    # Atomic write: serialize to a temp file in the same directory, then
+    # os.replace() it into place. A crash/restart mid-write can corrupt only
+    # the temp file, never the live cache. (Same fix as the 2026-06-22 Kuber
+    # brick, ported to DriftEdge where the bug was still latent.)
+    tmp = p.with_suffix(".parquet.tmp")
     pq.write_table(pa.Table.from_pandas(df, preserve_index=False),
-                   p, compression="snappy")
+                   tmp, compression="snappy")
+    os.replace(tmp, p)
 
 
 def classify_and_cache(data_dir: Path, *,
