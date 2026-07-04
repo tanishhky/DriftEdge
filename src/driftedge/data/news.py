@@ -74,13 +74,26 @@ _RSS_FEEDS: list[tuple[str, str]] = [
 ]
 
 
+# Hard cap on any single feed fetch. 2026-07-04: feedparser.parse(url) does
+# its OWN networking via urllib with NO timeout; one RSS host that accepted
+# the TCP connection and then stalled mid-TLS-handshake blocked the daemon's
+# main thread in a bare socket read() for 13 hours (last event:
+# news.sweep_start 08:55:45Z, then silence). feedparser must NEVER be given
+# a URL again - we fetch the bytes ourselves with a timeout and hand it the
+# payload only.
+_RSS_TIMEOUT_S = 15.0
+
+
 def fetch_rss(source_name: str, url: str, limit: int = 30) -> list[dict]:
     """Fetch one RSS feed and normalize to our schema."""
     items: list[dict] = []
     with obs.timed("api", "news.rss", done_level="DEBUG",
                    source=source_name, url=url) as t:
         try:
-            feed = feedparser.parse(url)
+            resp = requests.get(url, timeout=_RSS_TIMEOUT_S,
+                                headers={"User-Agent": "driftedge-news/0.1"})
+            resp.raise_for_status()
+            feed = feedparser.parse(resp.content)
         except Exception as exc:
             obs.event(channel="error", kind="news.rss_fail",
                       level="WARNING", source=source_name, err=str(exc))

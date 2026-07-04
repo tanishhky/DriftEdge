@@ -52,6 +52,12 @@ class Config:
     # grace_hours = how long past resolution we keep asking the venue before
     # falling back to last-book / write-off.
     settlement_grace_hours: float = 24.0
+    # Process-wide default socket timeout for the poll daemon (2026-07-04):
+    # a feedparser-internal fetch with no timeout hung the daemon for 13 h
+    # in a bare socket read. The direct call is fixed, but this guarantees
+    # the CLASS of bug is gone: any future library call that opens a socket
+    # without an explicit timeout inherits this instead of blocking forever.
+    socket_timeout_s: float = 30.0
     kuber_allow_one_sided: bool = False
 
 
@@ -92,4 +98,6 @@ def load() -> Config:
             "KUBER_ALLOW_ONE_SIDED", "0").lower() in ("1", "true", "yes"),
         settlement_grace_hours=float(
             os.getenv("DRIFTEDGE_SETTLEMENT_GRACE_HOURS", "24")),
+        socket_timeout_s=float(
+            os.getenv("DRIFTEDGE_SOCKET_TIMEOUT_S", "30")),
     )

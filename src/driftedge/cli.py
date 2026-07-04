@@ -145,9 +145,16 @@ def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
     """Long-running polling daemon. Refresh markets periodically; snapshot
     orderbooks for the top-N by 24h volume on a tighter loop.
     """
+    # Never hang forever on a socket: any library call that opens a socket
+    # without its own timeout inherits this default (see config docstring;
+    # the 2026-07-04 feedparser hang is why this exists).
+    import socket
+    socket.setdefaulttimeout(c.socket_timeout_s)
+
     obs.event(channel="run", kind="poll.start", level="INFO",
               top_n=args.top_n, book_interval_s=args.book_interval_s,
-              market_refresh_s=args.market_refresh_s)
+              market_refresh_s=args.market_refresh_s,
+              socket_timeout_s=c.socket_timeout_s)
 
     client = PolymarketClient()
     kalshi = KalshiClient(env="prod")
