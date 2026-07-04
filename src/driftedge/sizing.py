@@ -1,4 +1,4 @@
-"""Three trader sizers — same entry/exit rules, different position sizing.
+"""Trader sizers — same entry/exit rules, different position sizing.
 
 The framework:
   - Each trader has a starting bankroll, tracked cash, and tracked open
@@ -7,32 +7,54 @@ The framework:
     amount (0 to skip the trade).
   - Per-position cap and aggregate exposure cap apply universally.
   - Sizers are pure functions — they consult bankroll + exposure + the
-    candidate's market state, and return a number.
+    candidate's market state (+ a calibration posterior), and return a
+    number.
 
-The three traders:
-  1. KELLY: quarter-Kelly with conservative p_estimated default (0.45).
-     Sized for edge; swap p_estimated for path-engine output when M2 ships.
+Active traders (2026-07-04 roster):
+  1. KELLY: fractional Kelly sized from the empirical-Bayes calibration
+     posterior (see `calibration.py`). Refuses any trade whose posterior
+     EV <= 0 — with no evidence of edge it does not bet. This replaced
+     the hardcoded p_estimated=0.45, which asserted a permanent 5pp edge
+     over the martingale prior that realized data never supported.
   2. EQUAL: every trade gets the same fraction of bankroll (max_single).
-     The "naive diversifier" baseline.
-  3. VOLWT: inverse-Bernoulli-stddev weighted. Markets with lower
-     variance get more capital. Risk-parity-style for binary contracts.
+     The "naive diversifier" baseline — deliberately NOT gated on the
+     calibration posterior, so it keeps producing the unconditional
+     evidence stream that calibration learns from.
 
-All three share the same hard caps (per-position max and aggregate max)
-so blow-up risk is identical.
+Retired traders (2026-07-04, history preserved in paper_trades.parquet):
+  - VOLWT: inverse-Bernoulli-stddev weighting degenerated to equal sizing
+    in practice — its entire trade record was byte-identical to EQUAL's
+    (the mild <=1.5x scale always saturated the same caps). Running it was
+    paying storage and attention for a duplicate.
+  - RESOLUTION: bought YES on any [0.25,0.50] near-resolution market with
+    no probability estimate at all (price != probability, ADR 0003);
+    realized -$4.2k before the 2026-06-18 quarantine. Retired outright.
+
+All sizing limits are env-overridable (no in-code retuning needed).
 """
 
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
+from typing import Optional
+
+from .calibration import BetStats, prior_only
 
 
-# Shared hard limits (apply to every trader; configurable later).
-MAX_SINGLE_EXPOSURE = 0.02   # 2% of bankroll per position
-MAX_TOTAL_EXPOSURE = 0.50    # 50% of bankroll across all open positions
-MIN_POSITION_USD = 5.00      # below this, fees would dominate
-DEFAULT_P_ESTIMATED = 0.45   # used by Kelly until path engine ships
-KELLY_KAPPA = 0.25           # fractional Kelly multiplier
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Shared hard limits (apply to every trader).
+MAX_SINGLE_EXPOSURE = _env_float("DRIFTEDGE_MAX_SINGLE_EXPOSURE", 0.02)
+MAX_TOTAL_EXPOSURE = _env_float("DRIFTEDGE_MAX_TOTAL_EXPOSURE", 0.50)
+MIN_POSITION_USD = _env_float("DRIFTEDGE_MIN_POSITION_USD", 5.00)
+KELLY_KAPPA = _env_float("DRIFTEDGE_KELLY_FRACTION", 0.25)
 
 
 @dataclass(frozen=True)
@@ -61,7 +83,8 @@ class TraderState:
 
 # ── Sizer functions ──────────────────────────────────────────────────────
 #
-# Each returns the USD size to commit (0 to skip).
+# Each returns the USD size to commit (0 to skip). All accept the shared
+# calibration posterior (may be None; only Kelly uses it).
 
 def _apply_caps(size_usd: float, state: TraderState) -> float:
     """Apply per-position cap, aggregate-exposure cap, cash floor, then
@@ -82,49 +105,53 @@ def _apply_caps(size_usd: float, state: TraderState) -> float:
 
 
 def kelly_size(state: TraderState, *, c: float, target: float, stop: float,
-               p_estimated: float = DEFAULT_P_ESTIMATED) -> float:
-    """Quarter-Kelly with conservative p_estimated default.
+               calib: Optional[BetStats] = None) -> float:
+    """Fractional Kelly from the calibration posterior.
 
-    For long Yes at price c, target T, stop S:
-        win_return  a = (T - c) / c
-        loss_return b = (c - S) / c
-        Kelly       f* = (p*a - q*b) / (a*b),  where q = 1 - p
-        applied size = max(0, kappa * f*) * bankroll
-    Then capped by per-position and aggregate exposure limits.
+    With win prob p, win return a, loss magnitude b (all per $ staked):
+        EV  = p*a - q*b          (q = 1 - p)
+        f*  = EV / (a*b)
+        size = kappa * f* * bankroll,  0 when EV <= 0.
+
+    With calib=None the martingale prior applies, whose EV is exactly 0 —
+    no evidence, no bet. This is intentional: the sizer only deploys when
+    realized history says the (band, category) bet has positive
+    expectancy, and b_hat reflects the REAL gap-through-stop losses, not
+    the designed stop distance.
     """
     if c <= 0 or c >= 1 or stop >= c or target <= c:
         return 0.0
-    a = (target - c) / c
-    b = (c - stop) / c
+    if calib is None:
+        calib = prior_only(c=c, target=target, stop=stop)
+    a, b = calib.a_hat, calib.b_hat
     if a <= 0 or b <= 0:
         return 0.0
-    p = max(0.0, min(1.0, p_estimated))
-    q = 1.0 - p
-    f_star = (p * a - q * b) / (a * b)
-    if f_star <= 0:
+    ev = calib.ev_per_usd
+    if ev <= 0:
         return 0.0
+    f_star = ev / (a * b)
     raw = state.bankroll_init * KELLY_KAPPA * f_star
     return _apply_caps(raw, state)
 
 
 def equal_weight_size(state: TraderState, *, c: float, target: float,
-                      stop: float, p_estimated: float = DEFAULT_P_ESTIMATED) -> float:
-    """Fixed per-position fraction = MAX_SINGLE_EXPOSURE. Pure naive diversifier."""
+                      stop: float, calib: Optional[BetStats] = None) -> float:
+    """Fixed per-position fraction = MAX_SINGLE_EXPOSURE. Pure naive
+    diversifier and the calibration evidence generator — takes every
+    rule-qualified trade unconditionally."""
     raw = state.bankroll_init * MAX_SINGLE_EXPOSURE
     return _apply_caps(raw, state)
 
 
 def vol_weighted_size(state: TraderState, *, c: float, target: float,
-                      stop: float, p_estimated: float = DEFAULT_P_ESTIMATED) -> float:
-    """Inverse-Bernoulli-stddev weighting.
+                      stop: float, calib: Optional[BetStats] = None) -> float:
+    """RETIRED 2026-07-04 — kept for reference and old tests only.
 
-    For a Bernoulli(c), stddev = sqrt(c*(1-c)).
-    Reference stddev at c=0.5 (max uncertainty) = 0.5.
-    Weight = 0.5 / stddev(c), capped at 1.5 so we don't over-allocate
-    extreme markets where the rule rarely fires.
-
-    Result: markets closer to 0 or 1 get slightly MORE capital than
-    markets near 0.5. The scaling is intentionally mild (factor < 1.5×).
+    Inverse-Bernoulli-stddev weighting: weight = 0.5 / sqrt(c*(1-c)),
+    capped at 1.5x. In the [0.30, 0.40] entry band the scale lives in
+    [1.02, 1.09] and the per-position cap flattens it entirely, so this
+    produced a trade record byte-identical to EQUAL's. Not registered in
+    SIZERS.
     """
     if c <= 0 or c >= 1:
         return 0.0
@@ -136,11 +163,10 @@ def vol_weighted_size(state: TraderState, *, c: float, target: float,
     return _apply_caps(raw, state)
 
 
-# Registry — keep adding new sizers here.
+# Registry — active standard traders only.
 SIZERS = {
     "kelly":  kelly_size,
     "equal":  equal_weight_size,
-    "volwt":  vol_weighted_size,
 }
 
 
@@ -149,7 +175,13 @@ SIZERS = {
 # (bankroll, cash, equity) — so they appear in `all_trader_labels()` and get
 # seeded by state_persist — but NOT in `SIZERS` / `trader_labels()`, which
 # drives the standard paper.tick loop.
-SELF_MANAGED_TRADERS: list[str] = ["volharvest", "resolution"]
+SELF_MANAGED_TRADERS: list[str] = ["volharvest"]
+
+# Retired traders: no ticks, no new positions. Their state rows and trade
+# history stay on disk (and remain calibration evidence where applicable).
+# Retire via `driftedge retire-trader <name>` which liquidates open
+# positions first.
+RETIRED_TRADERS: list[str] = ["volwt", "resolution"]
 
 
 def trader_labels() -> list[str]:
@@ -158,5 +190,5 @@ def trader_labels() -> list[str]:
 
 
 def all_trader_labels() -> list[str]:
-    """Every trader the platform knows about, for state-init + dashboards."""
+    """Every ACTIVE trader, for state-init + dashboards."""
     return list(SIZERS.keys()) + list(SELF_MANAGED_TRADERS)

@@ -133,6 +133,54 @@ def save_state(data_dir: Path, states: dict[str, TraderState]) -> None:
     obs.bump("persist_writes")
 
 
+def rebuild_from_ledger(data_dir: Path, bankroll: float = 10000.0) -> dict:
+    """Rebuild paper_state.parquet from paper_trades.parquet (authoritative).
+
+    Needed after out-of-band writes to the ledger (settlement CLI, trader
+    retirement) raced a live daemon tick: the daemon loads state at tick
+    start and saves at tick end, so a CLI state write landing mid-tick is
+    silently overwritten. The trades ledger itself is upserted by trade_id
+    and survives. Invariants used (paper engine, no per-trade fees):
+
+        open_exposure = sum(entry_size_usd of open rows)
+        closed_pnl    = sum(pnl_usd of closed rows)
+        cash          = bankroll_init + closed_pnl - open_exposure
+    """
+    from . import paper_persist as pp
+
+    positions = pp.load_positions(data_dir)
+    existing = load_state(data_dir)
+    per: dict[str, dict[str, float]] = {}
+    for p in positions:
+        tid = str(p.get("trader") or "")
+        if not tid:
+            continue
+        slot = per.setdefault(tid, {"open": 0.0, "closed": 0.0})
+        if p.get("status") == "open":
+            slot["open"] += float(p.get("entry_size_usd") or 0.0)
+        else:
+            slot["closed"] += float(p.get("pnl_usd") or 0.0)
+
+    states: dict[str, TraderState] = {}
+    for tid in set(per) | set(existing):
+        bank = (existing[tid].bankroll_init if tid in existing else bankroll)
+        slot = per.get(tid, {"open": 0.0, "closed": 0.0})
+        states[tid] = TraderState(
+            trader=tid, bankroll_init=bank,
+            cash_usd=bank + slot["closed"] - slot["open"],
+            open_exposure=slot["open"],
+            closed_pnl=slot["closed"],
+        )
+    save_state(data_dir, states)
+    summary = {tid: {"cash": round(s.cash_usd, 2),
+                     "exposure": round(s.open_exposure, 2),
+                     "closed_pnl": round(s.closed_pnl, 2)}
+               for tid, s in states.items()}
+    obs.event(channel="persist", kind="paper.state.rebuild", level="INFO",
+              traders=len(states))
+    return summary
+
+
 def apply_open(state: TraderState, size_usd: float) -> TraderState:
     return TraderState(
         trader=state.trader,

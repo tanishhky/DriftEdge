@@ -383,8 +383,8 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
     for p in positions:
         if p.get("status") != "open":
             continue
-        if (p.get("trader") or "") in sizing.SELF_MANAGED_TRADERS:
-            continue
+        if (p.get("trader") or "") not in sizing.trader_labels():
+            continue  # self-managed agents + retired traders
         v = p.get("venue") or "polymarket"
         mid = str(p.get("market_id") or "")
         if mid:
@@ -479,16 +479,29 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
         if not should_open(book, rule, as_of_ts=as_of_ts,
                            resolution_ts=m.get("end_date")):
             continue
+        # Empirical-Bayes posterior for this (entry price, category) bet,
+        # shared by all sizers. Uses only trades realized before as_of_ts.
+        from . import calibration
+        calib = calibration.bet_stats(
+            positions, c=book.best_ask, target=rule.target, stop=rule.stop,
+            category=m.get("category") or "other", as_of_ts=as_of_ts)
         for trader_id, sizer_fn in sizing.SIZERS.items():
             if (trader_id, venue, mid) in open_by_key:
                 continue
             size_usd = sizer_fn(states[trader_id], c=book.best_ask,
-                                target=rule.target, stop=rule.stop)
+                                target=rule.target, stop=rule.stop,
+                                calib=calib)
             if size_usd <= 0:
                 continue
             new_pos = open_position(m, book, rule, as_of_ts,
                                     trader=trader_id, size_usd=size_usd,
                                     venue=venue)
+            # Audit trail: what the sizer believed at entry time.
+            new_pos.update({
+                "p_hat_at_entry": round(calib.p_hat, 4),
+                "ev_per_usd_at_entry": round(calib.ev_per_usd, 4),
+                "calib_n_at_entry": calib.n_evidence,
+            })
             opened.append(new_pos)
             per_trader_opened[trader_id] += 1
             states[trader_id] = sp.apply_open(states[trader_id], size_usd)
@@ -501,6 +514,7 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
     # Rebuild the open-positions list AFTER the entry/exit pass so the
     # MTM reflects the position book we actually hold at as_of_ts.
     open_positions_now = list(open_by_key.values()) + opened
+    active_std = set(sizing.trader_labels())
 
     # Bug fix: ensure book_mids covers ALL open non-self-managed positions,
     # not just the markets visited in this tick's tracked list. A position
@@ -510,7 +524,7 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
     for pos in positions:
         if pos.get("status") != "open":
             continue
-        if (pos.get("trader") or "") in sizing.SELF_MANAGED_TRADERS:
+        if (pos.get("trader") or "") not in active_std:
             continue
         v = pos.get("venue", "polymarket")
         mid_key = str(pos.get("market_id") or "")
@@ -522,11 +536,12 @@ def tick(data_dir: Path, markets: list[dict], rule: EntryRule,
             book_mids[(v, mid_key)] = fallback.mid
 
     # Bug fix: volharvest manages its own equity snapshot in volharvest.tick().
-    # Exclude it here to avoid double rows with stale state values.
-    equity_states = {k: v for k, v in states.items()
-                     if k not in sizing.SELF_MANAGED_TRADERS}
+    # Exclude it here to avoid double rows with stale state values. Retired
+    # traders (volwt, resolution) are excluded too: their frozen state would
+    # otherwise append an identical equity row every tick forever.
+    equity_states = {k: v for k, v in states.items() if k in active_std}
     equity_positions = [p for p in open_positions_now
-                        if (p.get("trader") or "") not in sizing.SELF_MANAGED_TRADERS]
+                        if (p.get("trader") or "") in active_std]
     peaks = ep.latest_peaks(data_dir)
     snapshots = ep.build_snapshot(
         ts=as_of_ts,

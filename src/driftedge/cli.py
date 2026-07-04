@@ -278,6 +278,22 @@ def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
                     obs.event(channel="error", kind="poll.markets_fail",
                               level="WARNING", venue="kalshi", err=str(exc))
 
+                # ── Settlement sweep for positions past resolution ──
+                # Zombie killer (2026-07-04): positions whose market resolved
+                # while the daemon was down can never exit via the book-based
+                # paths (the book 404s forever). Ask the venue for the actual
+                # outcome and settle at 0/1. Runs on the market-refresh
+                # cadence; per-market backoff inside.
+                try:
+                    from . import settlement
+                    settlement.settle_stuck_positions(
+                        c.data_dir, poly_client=client, kalshi_client=kalshi,
+                        grace_hours=c.settlement_grace_hours)
+                except Exception as exc:
+                    obs.event(channel="error", kind="settle.sweep_fail",
+                              level="WARNING", err=str(exc),
+                              exc_type=type(exc).__name__)
+
                 # ── equity_history housekeeping ──
                 # `append_snapshot` rewrites the whole parquet on every
                 # tick. Without bounded trim, write latency grows with file
@@ -369,21 +385,11 @@ def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
                           level="WARNING", err=str(exc),
                           exc_type=type(exc).__name__)
 
-            # Resolution tick — hold-to-binary agent. Enters [0.25, 0.50]
-            # markets resolving ≤72h away; holds until resolution or
-            # dynamic stop; force-exits 1h before resolution.
-            # Resolution agent is QUARANTINED by default — it has no edge
-            # (buys YES on any [0.25,0.50] near-resolution market, price !=
-            # probability) and bled -$4.2k. Re-enable only with a real
-            # p_estimate via DRIFTEDGE_RESOLUTION_ENABLED=1. (2026-06-18)
-            if c.resolution_enabled:
-                try:
-                    from .agents import resolution as resolution_agent
-                    resolution_agent.tick(c.data_dir, all_markets)
-                except Exception as exc:
-                    obs.event(channel="error", kind="resolution.tick_fail",
-                              level="WARNING", err=str(exc),
-                              exc_type=type(exc).__name__)
+            # (resolution agent RETIRED 2026-07-04: it had no edge — bought
+            # YES on any [0.25,0.50] near-resolution market, price !=
+            # probability — and bled -$4.2k before its 2026-06-18
+            # quarantine. Code kept in agents/resolution.py for reference;
+            # its trader state row is preserved as history.)
 
             # Kuber tick (6th agent) — Kalshi-only, real-money-capable.
             # Runs LAST so it observes the same markets but maintains its
@@ -471,6 +477,25 @@ def build_parser() -> argparse.ArgumentParser:
                         help="One sweep of news adapters (RSS + GDELT + Reddit) with VADER sentiment.")
     fn.set_defaults(func=cmd_fetch_news)
 
+    st = sub.add_parser("settle",
+                        help="One-off settlement sweep: close open positions "
+                             "whose market already resolved (venue outcome).")
+    st.set_defaults(func=cmd_settle)
+
+    rc = sub.add_parser("reconcile-state",
+                        help="Rebuild paper_state.parquet from the trades "
+                             "ledger. Run with the poll daemon STOPPED — a "
+                             "live tick can overwrite out-of-band state "
+                             "writes (load-at-tick-start / save-at-tick-end).")
+    rc.set_defaults(func=cmd_reconcile_state)
+
+    rt = sub.add_parser("retire-trader",
+                        help="Liquidate ALL open positions of a trader "
+                             "(settlement outcome where known, else last book "
+                             "bid, else 0). History rows are preserved.")
+    rt.add_argument("trader")
+    rt.set_defaults(func=cmd_retire_trader)
+
     return p
 
 
@@ -478,6 +503,37 @@ def cmd_fetch_news(_: argparse.Namespace, c: cfg.Config) -> int:
     from .data import news as news_mod
     result = news_mod.fetch_all(c.data_dir)
     obs.event(channel="run", kind="news.cli_done", level="INFO", **result)
+    return 0
+
+
+def cmd_settle(_: argparse.Namespace, c: cfg.Config) -> int:
+    from . import settlement
+    result = settlement.settle_stuck_positions(
+        c.data_dir,
+        poly_client=PolymarketClient(),
+        kalshi_client=KalshiClient(env="prod"),
+        grace_hours=c.settlement_grace_hours)
+    obs.event(channel="run", kind="settle.cli_done", level="INFO", **result)
+    print(result)
+    return 0
+
+
+def cmd_reconcile_state(_: argparse.Namespace, c: cfg.Config) -> int:
+    from .data import state_persist as sp
+    summary = sp.rebuild_from_ledger(c.data_dir)
+    for tid, row in sorted(summary.items()):
+        print(f"{tid:12s} {row}")
+    return 0
+
+
+def cmd_retire_trader(args: argparse.Namespace, c: cfg.Config) -> int:
+    from . import settlement
+    result = settlement.liquidate_trader(
+        c.data_dir, args.trader,
+        poly_client=PolymarketClient(),
+        kalshi_client=KalshiClient(env="prod"))
+    obs.event(channel="run", kind="retire.cli_done", level="INFO", **result)
+    print(result)
     return 0
 
 

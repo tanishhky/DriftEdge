@@ -19,6 +19,7 @@ That's a 24-cent move on a 36-cent ticket (+67% return) without taking event var
 > **Status notes (2026-06):**
 > - **Resolution is quarantined** (default off, `DRIFTEDGE_RESOLUTION_ENABLED=0`). An audit found it had no edge: it bought YES on any market with ask in `[0.25, 0.50]` near resolution with no probability estimate (price != probability) and bled. Re-enable only with a real `p_estimate`.
 > - **Daemon stability fixed.** A `liquidity`-sort KeyError could brick the poll loop into a do-nothing spin, and resolved-market orderbooks were re-requested forever (a 404 storm that dragged cadence). Both fixed; a one-sided-book guard and per-tick visibility were added.
+> - **Classifier cache hardened.** The market-category cache now writes atomically and self-heals: a corrupt `market_categories.parquet` (e.g. a write interrupted by a restart) is quarantined and rebuilt instead of throwing `ArrowInvalid` every tick, and a schema guard prevents the recurring `KeyError: 'market_id'` on a partially-written frame.
 > - The embedded Kuber 4th sleeve was renamed `volharvest` -> `halfkelly` (it never ran the hedge logic). Paper ledgers were reset after these fixes, so equity curves start fresh.
 
 **Known v0 limitation:** entry/target/stop thresholds (`[0.30, 0.40]` entry, `0.60` target, `0.20` stop) are currently **hardcoded**, not computed from market statistics. The proper version (per-market confidence intervals from observed price history) is on the roadmap. See ADR 0003 for the price-vs-probability discipline that keeps this swap clean.

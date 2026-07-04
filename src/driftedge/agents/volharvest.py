@@ -81,25 +81,101 @@ class VolHarvestRule:
     min_position_usd: float = 5.00
     exit_mode: str = "early_exit"        # 'early_exit' | 'hedge'
 
+    # ── Max-horizon entry gate (2026-07-04) ──
+    # The strategy's realized edge comes from fast-resolving markets where
+    # the dog can pop within hours (sports: +$1,738 at 73% hit). Entering
+    # long-dated longshots ("Putin out by December" at 0.16) via the same
+    # price window is a different trade entirely: months of naked theta
+    # bleed with no harvest cycle and no stop. By 2026-07-03 these had the
+    # whole 50% aggregate cap pinned while marking down -$1.2k, starving
+    # the strategy of the trades that actually make money.
+    #
+    # The cap is FORMULATED from the strategy's own realized behavior, not
+    # hardcoded: horizon = quantile(q) of hold-times of past early_exit
+    # winners x a safety multiplier, clamped to [floor, cap]. Cold start
+    # (< min evidence) uses the cold_start value. max_horizon_h != None
+    # overrides the adaptation entirely.
+    max_horizon_h: Optional[float] = None    # None = adaptive
+    horizon_quantile: float = 0.90
+    horizon_multiplier: float = 2.0
+    horizon_floor_h: float = 48.0
+    horizon_cap_h: float = 240.0
+    horizon_cold_start_h: float = 168.0
+    horizon_min_evidence: int = 10
+
 
 # ── Decision predicates ──────────────────────────────────────────────────
 
+def adaptive_max_horizon_h(closed_trades: list[dict],
+                           rule: VolHarvestRule, *,
+                           as_of_ts: str) -> float:
+    """Max hours-to-resolution accepted for a NEW dog entry.
+
+    Derived from the strategy's own winners: if past early-exit wins were
+    harvested within H hours (quantile q of hold times), a market that
+    doesn't resolve for many multiples of H offers the same entry price
+    with far more dead capital time and decay risk. Only trades with
+    exit_ts <= as_of_ts count (no lookahead).
+    """
+    if rule.max_horizon_h is not None:
+        return rule.max_horizon_h
+    as_of_dt = parse_iso(as_of_ts)
+    holds: list[float] = []
+    for t in closed_trades:
+        if t.get("trader") != TRADER_ID:
+            continue
+        if t.get("exit_reason") != "early_exit":
+            continue
+        pnl = t.get("pnl_usd")
+        if pnl is None or not (float(pnl) > 0):
+            continue
+        entry_ts, exit_ts = t.get("entry_ts"), t.get("exit_ts")
+        if not entry_ts or not exit_ts:
+            continue
+        try:
+            exit_dt = parse_iso(str(exit_ts))
+            if exit_dt > as_of_dt:
+                continue
+            holds.append((exit_dt - parse_iso(str(entry_ts)))
+                         .total_seconds() / 3600.0)
+        except (ValueError, TypeError):
+            continue
+    if len(holds) < rule.horizon_min_evidence:
+        return rule.horizon_cold_start_h
+    holds.sort()
+    idx = min(len(holds) - 1, int(rule.horizon_quantile * len(holds)))
+    horizon = holds[idx] * rule.horizon_multiplier
+    return max(rule.horizon_floor_h, min(rule.horizon_cap_h, horizon))
+
+
 def should_open_dog(book: BookTop, rule: VolHarvestRule, *,
                     as_of_ts: str,
-                    resolution_ts: Optional[str]) -> bool:
+                    resolution_ts: Optional[str],
+                    max_horizon_h: Optional[float] = None) -> bool:
     """Open the dog leg when the YES ask is in the underdog window AND
-    we're not already in the force-exit window."""
+    the market resolves inside (force_exit_window, max_horizon].
+
+    A missing/unparseable resolution_ts REJECTS the entry (changed
+    2026-07-04): without it neither the time force-exit nor settlement
+    can ever fire, so such a position can only leave the book via an
+    early-exit pop — if the dog loses, it is a guaranteed zombie
+    ("Will Logan Webb strike out the most batters" sat at mid 0.0025
+    with no resolution_ts and no way out).
+    """
     if not (rule.dog_low <= book.best_ask <= rule.dog_high):
         return False
-    if resolution_ts:
-        try:
-            t_now = datetime.fromisoformat(as_of_ts.replace("Z", "+00:00"))
-            t_res = datetime.fromisoformat(resolution_ts.replace("Z", "+00:00"))
-            hours_left = (t_res - t_now).total_seconds() / 3600.0
-            if hours_left < rule.force_exit_hours_before_resolution:
-                return False
-        except (ValueError, TypeError):
-            pass
+    if not resolution_ts:
+        return False
+    try:
+        t_now = datetime.fromisoformat(as_of_ts.replace("Z", "+00:00"))
+        t_res = datetime.fromisoformat(str(resolution_ts).replace("Z", "+00:00"))
+        hours_left = (t_res - t_now).total_seconds() / 3600.0
+    except (ValueError, TypeError):
+        return False
+    if hours_left < rule.force_exit_hours_before_resolution:
+        return False
+    if max_horizon_h is not None and hours_left > max_horizon_h:
+        return False
     return True
 
 
@@ -354,6 +430,9 @@ def tick(data_dir: Path, markets: list[dict],
     own_open = [p for p in positions
                 if p.get("trader") == TRADER_ID and p.get("status") == "open"]
 
+    # Horizon gate for new entries, adapted from our own realized winners.
+    max_horizon_h = adaptive_max_horizon_h(positions, rule, as_of_ts=as_of_ts)
+
     # Index by (venue, market_id) → {leg → position}
     own_by_market: dict[tuple[str, str], dict[str, dict]] = {}
     for p in own_open:
@@ -482,7 +561,8 @@ def tick(data_dir: Path, markets: list[dict],
         # commit capital at a price the daemon can't refresh.
         if not own_by_market.get((venue, mid_id)) and not m.get("_orphan"):
             if should_open_dog(book, rule, as_of_ts=as_of_ts,
-                                resolution_ts=resolution_ts):
+                                resolution_ts=resolution_ts,
+                                max_horizon_h=max_horizon_h):
                 size_usd = _dog_size(bankroll_init, cash_usd, open_exposure,
                                       rule)
                 if size_usd > 0:
@@ -540,6 +620,7 @@ def tick(data_dir: Path, markets: list[dict],
     obs.event(channel="fit", kind="volharvest.tick", level="INFO",
               as_of_ts=as_of_ts, markets_seen=len(markets),
               orphans_visited=len(orphan_stubs),
+              max_horizon_h=round(max_horizon_h, 1),
               **actions, equity_rows=len(snaps))
 
     return {"as_of_ts": as_of_ts, "orphans_visited": len(orphan_stubs),

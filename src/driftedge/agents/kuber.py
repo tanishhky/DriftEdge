@@ -67,6 +67,13 @@ SLEEVE_LABELS: list[str] = [
     "kuber:halfkelly",
 ]
 
+# Kelly prior for the kuber:kelly sleeve. Kept at the legacy 0.45 ON
+# PURPOSE: this agent mirrors the standalone Kuber repo running on the
+# VPS, and the two must stay behavior-identical until Kuber itself is
+# migrated to the calibration posterior (driftedge.calibration) that
+# replaced this constant for the main kelly trader on 2026-07-04.
+KUBER_DEFAULT_P_ESTIMATED = 0.45
+
 # Floor — Kalshi imposes a 1-contract minimum, and below $5 commission
 # eats too much of the trade.
 KUBER_MIN_POSITION_USD = 5.00
@@ -158,7 +165,7 @@ def kuber_size(sleeve_label: str, *, c: float, target: float, stop: float,
                kc: KuberConfig,
                sleeve_realized_pnl: float,
                sleeve_open_positions: int,
-               p_estimated: float = base_sizing.DEFAULT_P_ESTIMATED) -> float:
+               p_estimated: float = KUBER_DEFAULT_P_ESTIMATED) -> float:
     """Return the USD to commit on this candidate, or 0 to skip.
 
     Pipeline:

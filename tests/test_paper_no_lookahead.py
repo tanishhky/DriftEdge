@@ -126,16 +126,36 @@ def test_open_position_carries_trader_and_size():
     assert pos["shares"] > 0
 
 
-def test_three_sizers_produce_different_amounts():
-    """Sanity: the three sizers should not all return identical sizes."""
+def test_sizer_semantics_post_calibration():
+    """Kelly semantics after the 2026-07-04 calibration change:
+
+    * no evidence (prior-only) → the martingale prior has EV exactly 0,
+      so Kelly refuses to bet;
+    * a positive-EV posterior → Kelly bets, capped at the 2% per-position
+      limit;
+    * EQUAL keeps taking every rule-qualified trade (evidence generator).
+    """
+    from driftedge.calibration import BetStats
     from driftedge.sizing import (
-        TraderState, kelly_size, equal_weight_size, vol_weighted_size,
+        TraderState, kelly_size, equal_weight_size,
     )
     s = TraderState(trader="t", bankroll_init=10000.0, cash_usd=10000.0,
                     open_exposure=0.0, closed_pnl=0.0)
-    k = kelly_size(s, c=0.36, target=0.60, stop=0.20)
+
+    # Prior-only: EV = 0 → no bet.
+    assert kelly_size(s, c=0.36, target=0.60, stop=0.20) == 0.0
+
+    # Posterior with real edge → positive size, capped at 2%.
+    good = BetStats(p_hat=0.55, a_hat=0.667, b_hat=0.444, p0=0.40,
+                    n_evidence=50, category_matched=True)
+    k = kelly_size(s, c=0.36, target=0.60, stop=0.20, calib=good)
+    assert 0 < k <= 200.01
+
+    # Posterior with negative edge → refuses.
+    bad = BetStats(p_hat=0.30, a_hat=0.667, b_hat=0.80, p0=0.40,
+                   n_evidence=50, category_matched=True)
+    assert kelly_size(s, c=0.36, target=0.60, stop=0.20, calib=bad) == 0.0
+
+    # Equal is unconditional.
     e = equal_weight_size(s, c=0.36, target=0.60, stop=0.20)
-    v = vol_weighted_size(s, c=0.36, target=0.60, stop=0.20)
-    assert k > 0 and e > 0 and v > 0
-    # All capped at 2% of bankroll = $200
-    assert max(k, e, v) <= 200.01
+    assert e == 200.0
