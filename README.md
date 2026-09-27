@@ -16,13 +16,18 @@ That's a 24-cent move on a 36-cent ticket (+67% return) without taking event var
 
 ## Status
 
-**Shipped:** Polymarket **and Kalshi** ingestion, normalized Parquet persistence, continuous polling daemon, and a paper-trading engine with strict no-lookahead enforcement (ADR 0004). The race is now **five paper traders** on $10,000 bankrolls — Kelly, Equal-Wt, Vol-Wt, **VolHarvest** (an underdog-YES + synthetic-NO hedge agent), and **Resolution** — plus **Kuber**, a sixth, Kalshi-only, real-money-capable meta-agent (four sleeves; cut into its own repo at [Kuber](https://github.com/tanishhky/Kuber)).
+**Shipped:** Polymarket **and Kalshi** ingestion, normalized Parquet persistence, continuous polling daemon, and a paper-trading engine with strict no-lookahead enforcement (ADR 0004). The active race is **three paper traders** on $10,000 bankrolls: **Kelly** (sized on an empirically calibrated win probability), **Equal-Wt**, and **VolHarvest** (an underdog-YES + synthetic-NO hedge agent). Vol-Wt and Resolution were retired on 2026-07-04 after replay audits (see below). Separately there is **Kuber**, a sixth, Kalshi-only, real-money-capable meta-agent (four sleeves; cut into its own repo at [Kuber](https://github.com/tanishhky/Kuber)).
 
 > **Status notes (2026-06):**
 > - **Resolution is quarantined** (default off, `DRIFTEDGE_RESOLUTION_ENABLED=0`). An audit found it had no edge: it bought YES on any market with ask in `[0.25, 0.50]` near resolution with no probability estimate (price != probability) and bled. Re-enable only with a real `p_estimate`.
 > - **Daemon stability fixed.** A `liquidity`-sort KeyError could brick the poll loop into a do-nothing spin, and resolved-market orderbooks were re-requested forever (a 404 storm that dragged cadence). Both fixed; a one-sided-book guard and per-tick visibility were added.
 > - **Classifier cache hardened.** The market-category cache now writes atomically and self-heals: a corrupt `market_categories.parquet` (e.g. a write interrupted by a restart) is quarantined and rebuilt instead of throwing `ArrowInvalid` every tick, and a schema guard prevents the recurring `KeyError: 'market_id'` on a partially-written frame.
 > - The embedded Kuber 4th sleeve was renamed `volharvest` -> `halfkelly` (it never ran the hedge logic). Paper ledgers were reset after these fixes, so equity curves start fresh.
+>
+> **Status notes (2026-07-04):**
+> - **Kelly now sizes on an empirical-Bayes win probability** (`calibration.py`), replacing the hardcoded `p_estimated = 0.45`, which asserted a flat 45% win rate while the realized hit rate was about 30-37%. The prior is the gambler's-ruin probability that a driftless price hits the target before the stop, `p0 = (c - S) / (T - S)`; under that prior Kelly's expected value is exactly zero, so with no evidence of edge the sizer does not bet. Realized closed trades near the same entry price update the estimate, and payoffs are shrunk toward realized returns because binary markets gap through stops.
+> - **Vol-Wt retired:** its trade record was identical to Equal-Wt (the inverse-sigma scale always saturated the caps). **Resolution retired permanently.** `driftedge retire-trader` liquidates open positions.
+> - **Venue-outcome settlement** (`settlement.py`) closes positions stuck on resolved markets whose orderbooks no longer exist.
 
 **Known v0 limitation:** entry/target/stop thresholds (`[0.30, 0.40]` entry, `0.60` target, `0.20` stop) are currently **hardcoded**, not computed from market statistics. The proper version (per-market confidence intervals from observed price history) is on the roadmap. See ADR 0003 for the price-vs-probability discipline that keeps this swap clean.
 
@@ -39,7 +44,9 @@ That's a 24-cent move on a 36-cent ticket (+67% return) without taking event var
 | Parquet persistence (markets snapshots, orderbook snapshots, trades) | shipped |
 | Continuous polling daemon (launchd KeepAlive; spin-brick + 404-storm fixed) | shipped |
 | Paper-trading engine, lookahead-safe by construction | shipped |
-| 5-trader race (Kelly + Equal + Vol-Wt + VolHarvest + Resolution) | shipped (Resolution quarantined) |
+| 3-trader race (Kelly + Equal + VolHarvest) | shipped (Vol-Wt and Resolution retired 2026-07-04) |
+| Empirical-Bayes win-probability calibration for Kelly | shipped |
+| Venue-outcome settlement for stuck positions | shipped |
 | Kuber meta-agent (6th, Kalshi-only, real-money-capable) | shipped (own repo) |
 | Per-trader portfolio state (bankroll, cash, exposure, drawdown, peak equity) | shipped |
 | Near-resolution-market filter in polling loop | shipped |
@@ -51,17 +58,17 @@ That's a 24-cent move on a 36-cent ticket (+67% return) without taking event var
 
 ## The paper-trading horse race
 
-Independent agents operate on the same world state but with different sizing or strategy logic. Each gets a $10,000 paper bankroll. The three core sizers below share the same entry/exit triggers; VolHarvest and Resolution run their own logic.
+Independent agents operate on the same world state but with different sizing or strategy logic. Each gets a $10,000 paper bankroll. Kelly and Equal-Wt share the same entry/exit triggers; VolHarvest runs its own logic. Retired traders are listed for the record.
 
 | Trader | Rule |
 |---|---|
-| **Kelly** | Quarter-Kelly with conservative `p_estimated = 0.45`. Smaller positions on smaller edges; built so swapping `p_estimated` for path-engine output is a one-line change. |
+| **Kelly** | Quarter-Kelly on an empirical-Bayes win probability (gambler's-ruin prior, updated by realized trades near the same entry price). No evidence of edge means no bet. Swapping in path-engine output later is still a one-line change. |
 | **Equal-Wt** | Fixed 2 % of bankroll per position (max single exposure cap). The "naive diversifier" baseline. |
-| **Vol-Wt** | Inverse-Bernoulli-stddev weighted. Slight tilt toward extreme prices vs. mid-band. Risk-parity for binary contracts. |
+| **Vol-Wt** (retired) | Inverse-Bernoulli-stddev weighted. Retired 2026-07-04: the scale always saturated the caps, so its trades were identical to Equal-Wt. |
 | **VolHarvest** | Underdog-YES leg + an opportunistic synthetic-NO hedge; harvests intra-market path variance. Carries no directional stop. |
-| **Resolution** | Hold-to-binary near resolution. **Quarantined (default off)** — no edge in audit; re-enable only with a real probability estimate. |
+| **Resolution** (retired) | Hold-to-binary near resolution. Retired permanently 2026-07-04: no edge in audit (it bought on price alone, with no probability estimate). |
 
-Shared caps on the three sizers: 2 % per position, 50 % aggregate exposure, $5 min trade. A sixth agent, **Kuber** (Kalshi-only, real-money-capable, four sleeves), lives in its own repo.
+Shared caps on the sizers: 2 % per position, 50 % aggregate exposure, $5 min trade. A sixth agent, **Kuber** (Kalshi-only, real-money-capable, four sleeves), lives in its own repo.
 
 ## No-lookahead enforcement (ADR 0004)
 
