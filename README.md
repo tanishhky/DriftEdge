@@ -2,6 +2,8 @@
 
 ![tests](https://github.com/tanishhky/DriftEdge/actions/workflows/tests.yml/badge.svg)
 
+**Project page:** [tanishkyadav.me/projects/driftedge](https://www.tanishkyadav.me/projects/driftedge)
+
 **A free, open research platform for prediction markets: probability-path inference, flow-anomaly detection, Kelly-sized path trades.**
 
 DriftEdge studies prediction markets the way [PinSight](https://github.com/tanishhky/PinSight) studies 0DTE options. The thesis: a prediction market contract is a binary option whose price equals its implied probability. We can therefore reuse most of the options-market machinery (flow detection, microstructure analysis, Kelly sizing) and add what's unique to prediction markets — **the probability path through time**.
